@@ -7,7 +7,6 @@ import csv
 import time
 from decimal import Decimal, getcontext
 from collections import defaultdict
-from typing import Dict, Any, Tuple
 
 from web3 import Web3
 from eth_abi import decode as abi_decode
@@ -28,16 +27,17 @@ OUR_WALLETS = {
     "0x44a3f0354f4c10eb9cd93e522b5e3210d126f054": "team_mm2",
 }
 
-STATE_FILE = "state/state.json"
+STATE_DIR = "state"
+SYNC_FILE = os.path.join(STATE_DIR, "sync.json")
+EVENTS_FILE = os.path.join(STATE_DIR, "events.ndjson")
 OUT_DIR = "out"
 
-BACKFILL_CHUNK = 800
-SAFETY_WINDOW_BLOCKS = 50
+BACKFILL_CHUNK = 500
 CONFIRMATIONS_BUFFER = 2
 TIMEOUT = 60
 RETRIES = 6
 RETRY_SLEEP = 1.0
-SLEEP_BETWEEN_CHUNKS = 0.10
+SLEEP_BETWEEN_CHUNKS = 0.05
 BUCKET_SIZE = 50
 
 EXPECTED_TOKEN0 = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower()  # USDC
@@ -100,9 +100,6 @@ def tick_to_sqrt_price(tick: int) -> Decimal:
 
 
 def current_amounts_from_liquidity(liq: int, tick_lower: int, tick_upper: int, sqrt_price_x96: int):
-    """
-    Возвращает raw amount0 и raw amount1 как Decimal.
-    """
     L = Decimal(liq)
     sqrtP = Decimal(sqrt_price_x96) / Q96
     sqrtL = tick_to_sqrt_price(tick_lower)
@@ -140,7 +137,7 @@ def tick_to_bucket_floor(tick: int, bucket_size: int) -> int:
 # HELPERS
 # =========================================================
 def ensure_dirs():
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -167,9 +164,6 @@ def rpc_get_logs(params: dict):
 
 
 def get_logs_adaptive(from_block: int, to_block: int, topics: list, address: str):
-    """
-    Читает логи по диапазону. Если RPC ругается, делит диапазон пополам.
-    """
     if from_block > to_block:
         return []
 
@@ -185,11 +179,11 @@ def get_logs_adaptive(from_block: int, to_block: int, topics: list, address: str
     except Exception as e:
         if from_block == to_block:
             raise e
-
         mid = (from_block + to_block) // 2
-        left_logs = get_logs_adaptive(from_block, mid, topics, address)
-        right_logs = get_logs_adaptive(mid + 1, to_block, topics, address)
-        return left_logs + right_logs
+        return (
+            get_logs_adaptive(from_block, mid, topics, address)
+            + get_logs_adaptive(mid + 1, to_block, topics, address)
+        )
 
 
 def chunked_range(start_block: int, end_block: int, step: int):
@@ -226,38 +220,27 @@ def position_key(owner: str, tick_lower: int, tick_upper: int) -> str:
     return f"{owner.lower()}|{tick_lower}|{tick_upper}"
 
 
-def parse_position_key(key: str) -> Tuple[str, int, int]:
-    owner, tl, tu = key.split("|")
-    return owner, int(tl), int(tu)
-
-
 # =========================================================
-# STATE
+# SYNC
 # =========================================================
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
+def load_sync():
+    if not os.path.exists(SYNC_FILE):
         return {
-            "meta": {
-                "chain_id": CHAIN_ID,
-                "pool": str(POOL),
-            },
-            "sync": {
-                "last_scanned_block": None,
-            },
-            "positions": {},
+            "chain_id": CHAIN_ID,
+            "pool": str(POOL),
+            "last_scanned_block": None,
         }
-
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
+    with open(SYNC_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_state(state: Dict[str, Any]):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+def save_sync(sync):
+    with open(SYNC_FILE, "w", encoding="utf-8") as f:
+        json.dump(sync, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 # =========================================================
-# CORE
+# POOL INFO
 # =========================================================
 def load_pool_info():
     token0 = Web3.to_checksum_address(safe_call(pool_c.functions.token0()))
@@ -289,33 +272,63 @@ def load_pool_info():
         "fee": fee,
         "sqrt_price_x96": sqrt_price_x96,
         "current_tick": current_tick,
-        "current_price_token1_per_token0": sqrt_price_x96_to_price_token1_per_token0(
-            sqrt_price_x96, dec0, dec1
-        ),
+        "current_price_token1_per_token0": sqrt_price_x96_to_price_token1_per_token0(sqrt_price_x96, dec0, dec1),
         "pool_liquidity_raw": pool_liquidity,
     }
 
 
-def get_scan_range(state: Dict[str, Any], latest_block_safe: int) -> Tuple[int, int]:
-    last_scanned_block = state["sync"]["last_scanned_block"]
+# =========================================================
+# EVENTS STORAGE
+# =========================================================
+def load_existing_event_ids() -> set:
+    ids = set()
+    if not os.path.exists(EVENTS_FILE):
+        return ids
 
-    if last_scanned_block is None:
-        return FROM_BLOCK, latest_block_safe
+    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            ids.add(obj["event_id"])
+    return ids
 
-    start_block = max(FROM_BLOCK, int(last_scanned_block) - SAFETY_WINDOW_BLOCKS)
-    return start_block, latest_block_safe
+
+def append_events(events: list[dict]):
+    if not events:
+        return
+    with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+        for ev in events:
+            f.write(json.dumps(ev, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: int):
-    positions = state["positions"]
+# =========================================================
+# RPC -> EVENTS
+# =========================================================
+def collect_new_events(sync: dict, latest_block_safe: int):
+    last_scanned_block = sync["last_scanned_block"]
+    start_block = FROM_BLOCK if last_scanned_block is None else int(last_scanned_block) + 1
+    end_block = latest_block_safe
+
+    if start_block > end_block:
+        return {
+            "start_block": start_block,
+            "end_block": end_block,
+            "logs_scanned_this_run": 0,
+            "mint_events_this_run": 0,
+            "burn_events_this_run": 0,
+            "initialize_events_this_run": 0,
+            "new_events_written": 0,
+        }
+
+    existing_ids = load_existing_event_ids()
 
     total_logs = 0
-    total_new_mint = 0
-    total_new_burn = 0
+    total_mint = 0
+    total_burn = 0
     total_init = 0
-
-    # локальный дедуп этого запуска, потому что из-за safety window мы перечитываем overlap
-    seen_event_ids_this_run = set()
+    total_written = 0
 
     for chunk_from, chunk_to in chunked_range(start_block, end_block, BACKFILL_CHUNK):
         logs = get_logs_adaptive(
@@ -325,6 +338,7 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
             address=str(POOL),
         )
 
+        new_events = []
         mint_c = 0
         burn_c = 0
         init_c = 0
@@ -335,13 +349,20 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
             block_number = int(lg["blockNumber"])
             event_id = f"{tx_hash}:{log_index}"
 
-            if event_id in seen_event_ids_this_run:
+            if event_id in existing_ids:
                 continue
-            seen_event_ids_this_run.add(event_id)
 
-            topic0 = lg["topics"][0].hex()
+            topic0 = lg["topics"][0].hex().lower()
 
-            if topic0.lower() == INIT_TOPIC0.lower():
+            if topic0 == INIT_TOPIC0.lower():
+                new_events.append({
+                    "event_id": event_id,
+                    "event_type": "initialize",
+                    "block_number": block_number,
+                    "tx_hash": tx_hash,
+                    "log_index": log_index,
+                })
+                existing_ids.add(event_id)
                 init_c += 1
                 continue
 
@@ -351,8 +372,85 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
             owner = topic_to_address(lg["topics"][1]).lower()
             tick_lower = decode_int24_topic(lg["topics"][2])
             tick_upper = decode_int24_topic(lg["topics"][3])
+            liq_delta, amount0, amount1 = decode_mint_or_burn_data(lg["data"])
 
+            if topic0 == MINT_TOPIC0.lower():
+                ev_type = "mint"
+                mint_c += 1
+                signed_liq = liq_delta
+            elif topic0 == BURN_TOPIC0.lower():
+                ev_type = "burn"
+                burn_c += 1
+                signed_liq = -liq_delta
+            else:
+                continue
+
+            new_events.append({
+                "event_id": event_id,
+                "event_type": ev_type,
+                "block_number": block_number,
+                "tx_hash": tx_hash,
+                "log_index": log_index,
+                "owner": owner,
+                "tick_lower": tick_lower,
+                "tick_upper": tick_upper,
+                "liquidity_delta_raw": signed_liq,
+                "amount0_raw": amount0,
+                "amount1_raw": amount1,
+            })
+            existing_ids.add(event_id)
+
+        append_events(new_events)
+        sync["last_scanned_block"] = chunk_to
+        save_sync(sync)
+
+        total_logs += len(logs)
+        total_mint += mint_c
+        total_burn += burn_c
+        total_init += init_c
+        total_written += len(new_events)
+
+        print(
+            f"scanned {chunk_from}-{chunk_to} | "
+            f"logs={len(logs)} mint={mint_c} burn={burn_c} init={init_c} written={len(new_events)}"
+        )
+        time.sleep(SLEEP_BETWEEN_CHUNKS)
+
+    return {
+        "start_block": start_block,
+        "end_block": end_block,
+        "logs_scanned_this_run": total_logs,
+        "mint_events_this_run": total_mint,
+        "burn_events_this_run": total_burn,
+        "initialize_events_this_run": total_init,
+        "new_events_written": total_written,
+    }
+
+
+# =========================================================
+# EVENTS -> SNAPSHOT
+# =========================================================
+def rebuild_positions_from_events():
+    positions = {}
+
+    if not os.path.exists(EVENTS_FILE):
+        return positions
+
+    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            ev = json.loads(line)
+
+            if ev["event_type"] not in ("mint", "burn"):
+                continue
+
+            owner = ev["owner"]
+            tick_lower = int(ev["tick_lower"])
+            tick_upper = int(ev["tick_upper"])
             key = position_key(owner, tick_lower, tick_upper)
+
             if key not in positions:
                 positions[key] = {
                     "owner": owner,
@@ -363,66 +461,40 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
                     "minted_amount1_raw": 0,
                     "burned_amount0_raw": 0,
                     "burned_amount1_raw": 0,
-                    "first_seen_block": block_number,
-                    "last_seen_block": block_number,
+                    "first_seen_block": ev["block_number"],
+                    "last_seen_block": ev["block_number"],
                     "mint_count": 0,
                     "burn_count": 0,
                 }
 
             row = positions[key]
+            row["last_seen_block"] = max(int(row["last_seen_block"]), int(ev["block_number"]))
+            row["first_seen_block"] = min(int(row["first_seen_block"]), int(ev["block_number"]))
 
-            # Защита от overlap: если мы перечитали старый хвост, не хотим еще раз суммировать те же самые события.
-            # Поэтому при overlap мы сначала "обнуляем" состояние только если стартуем не с первого полного запуска.
-            # Но это сложно и ненадежно на row-level, поэтому делаем проще:
-            # если chunk начинается раньше или равен last_scanned_block, то rebuild корректнее делать с нуля.
-            # Однако чтобы не усложнять, используем state только для forward-режима:
-            # overlap допустим, потому что дедуп идет в рамках запуска, а chunk внутри одного запуска не дублируется.
+            liq_delta = int(ev["liquidity_delta_raw"])
+            amount0 = int(ev["amount0_raw"])
+            amount1 = int(ev["amount1_raw"])
 
-            row["last_seen_block"] = block_number
-            if row["first_seen_block"] is None:
-                row["first_seen_block"] = block_number
+            row["liquidity_raw"] += liq_delta
 
-            liq_delta, amount0, amount1 = decode_mint_or_burn_data(lg["data"])
-
-            if topic0.lower() == MINT_TOPIC0.lower():
-                row["liquidity_raw"] += liq_delta
+            if ev["event_type"] == "mint":
                 row["minted_amount0_raw"] += amount0
                 row["minted_amount1_raw"] += amount1
                 row["mint_count"] += 1
-                mint_c += 1
-
-            elif topic0.lower() == BURN_TOPIC0.lower():
-                row["liquidity_raw"] -= liq_delta
+            else:
                 row["burned_amount0_raw"] += amount0
                 row["burned_amount1_raw"] += amount1
                 row["burn_count"] += 1
-                burn_c += 1
 
             positions[key] = row
 
-        state["sync"]["last_scanned_block"] = chunk_to
-
-        total_logs += len(logs)
-        total_new_mint += mint_c
-        total_new_burn += burn_c
-        total_init += init_c
-
-        print(
-            f"scanned {chunk_from}-{chunk_to} | "
-            f"logs={len(logs)} mint={mint_c} burn={burn_c} init={init_c}"
-        )
-
-        time.sleep(SLEEP_BETWEEN_CHUNKS)
-
-    return {
-        "logs_scanned_this_run": total_logs,
-        "mint_events_this_run": total_new_mint,
-        "burn_events_this_run": total_new_burn,
-        "initialize_events_this_run": total_init,
-    }
+    return positions
 
 
-def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
+# =========================================================
+# EXPORTS
+# =========================================================
+def build_exports(positions: dict, pool_info: dict):
     positions_rows = []
     owner_aggr = defaultdict(lambda: {
         "owner_label": "external",
@@ -458,7 +530,7 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
     sym0 = pool_info["sym0"]
     sym1 = pool_info["sym1"]
 
-    for _, row in state["positions"].items():
+    for _, row in positions.items():
         liquidity_raw = int(row["liquidity_raw"])
         if liquidity_raw <= 0:
             continue
@@ -533,15 +605,7 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
 
             cur += BUCKET_SIZE
 
-    positions_rows.sort(
-        key=lambda r: (
-            r["owner_type"] != "ours",
-            -int(r["liquidity_raw"]),
-            r["owner"],
-            r["tick_lower"],
-            r["tick_upper"],
-        )
-    )
+    positions_rows.sort(key=lambda r: (r["owner_type"] != "ours", -int(r["liquidity_raw"]), r["owner"], r["tick_lower"], r["tick_upper"]))
 
     top_lp_rows = []
     for owner, ag in owner_aggr.items():
@@ -556,13 +620,7 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
             f"current_{sym1.lower()}": format_dec(ag["current_amount1"], 8),
         })
 
-    top_lp_rows.sort(
-        key=lambda r: (
-            r["owner_type"] != "ours",
-            -int(r["total_liquidity_raw"]),
-            r["owner"],
-        )
-    )
+    top_lp_rows.sort(key=lambda r: (r["owner_type"] != "ours", -int(r["total_liquidity_raw"]), r["owner"]))
 
     bucket_rows = []
     for bucket_low in sorted(bucket_map.keys()):
@@ -589,7 +647,6 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
         {"metric": "chain_id", "value": CHAIN_ID},
         {"metric": "pool", "value": str(POOL)},
         {"metric": "from_block", "value": FROM_BLOCK},
-        {"metric": "last_scanned_block", "value": state["sync"]["last_scanned_block"]},
         {"metric": "token0_symbol", "value": sym0},
         {"metric": "token1_symbol", "value": sym1},
         {"metric": "token0_address", "value": pool_info["token0"]},
@@ -620,7 +677,6 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
 def write_csv(path: str, rows: list, fieldnames: list | None = None):
     if fieldnames is None:
         fieldnames = list(rows[0].keys()) if rows else []
-
     with open(path, "w", newline="", encoding="utf-8") as f:
         if fieldnames:
             w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -635,6 +691,9 @@ def print_summary(summary_rows):
         print(f"{row['metric']}: {row['value']}")
 
 
+# =========================================================
+# MAIN
+# =========================================================
 def main():
     ensure_dirs()
 
@@ -643,7 +702,7 @@ def main():
     if latest_block_safe < FROM_BLOCK:
         raise RuntimeError("latest_block_safe < FROM_BLOCK")
 
-    state = load_state()
+    sync = load_sync()
     pool_info = load_pool_info()
 
     print("=== POOL INFO ===")
@@ -660,48 +719,18 @@ def main():
     print(f"Price {pool_info['sym1']} per 1 {pool_info['sym0']}: {pool_info['current_price_token1_per_token0']}")
 
     if pool_info["token0"].lower() != EXPECTED_TOKEN0 or pool_info["token1"].lower() != EXPECTED_TOKEN1:
-        print("\nWARNING: token0/token1 отличаются от ожидаемых USDC/LMTS.")
-        print("Скрипт все равно отработает, но проверь пул.\n")
+        print("\nWARNING: token0/token1 отличаются от ожидаемых USDC/LMTS.\n")
 
-    # ВАЖНО:
-    # если уже есть state и ты хочешь корректный incremental через overlap,
-    # текущая простая логика безопасна только если старый overlap не был уже посчитан повторно.
-    # Поэтому для первой корректной версии делаем так:
-    # - первый запуск с нуля
-    # - следующие запуски либо без overlap, либо потом допилим rebuild-from-events.
-    #
-    # Чтобы сейчас не портить state повторным overlap, временно отключаем overlap для persisted-state режима.
-    if state["sync"]["last_scanned_block"] is None:
-        start_block, end_block = FROM_BLOCK, latest_block_safe
-    else:
-        start_block = int(state["sync"]["last_scanned_block"]) + 1
-        end_block = latest_block_safe
+    print("\n=== COLLECT EVENTS ===")
+    run_stats = collect_new_events(sync, latest_block_safe)
+    for k, v in run_stats.items():
+        print(f"{k}: {v}")
 
-    if start_block > end_block:
-        print("\nNothing new to scan. Rebuilding exports only...")
-    else:
-        print("\n=== INDEXING ===")
-        print(f"Scan range: {start_block} -> {end_block}")
-        run_stats = process_logs_into_state(state, start_block, end_block)
+    print("\n=== REBUILD SNAPSHOT FROM EVENTS ===")
+    positions = rebuild_positions_from_events()
+    print(f"positions_rebuilt_total_keys: {len(positions)}")
 
-        print("\n=== RUN STATS ===")
-        for k, v in run_stats.items():
-            print(f"{k}: {v}")
-
-        save_state(state)
-
-    state["meta"]["token0"] = pool_info["token0"]
-    state["meta"]["token1"] = pool_info["token1"]
-    state["meta"]["token0_symbol"] = pool_info["sym0"]
-    state["meta"]["token1_symbol"] = pool_info["sym1"]
-    state["meta"]["token0_decimals"] = pool_info["dec0"]
-    state["meta"]["token1_decimals"] = pool_info["dec1"]
-    state["meta"]["tick_spacing"] = pool_info["tick_spacing"]
-    state["meta"]["fee"] = pool_info["fee"]
-    state["meta"]["pool_liquidity_raw"] = pool_info["pool_liquidity_raw"]
-    save_state(state)
-
-    positions_rows, top_lp_rows, bucket_rows, summary_rows = build_exports(state, pool_info)
+    positions_rows, top_lp_rows, bucket_rows, summary_rows = build_exports(positions, pool_info)
 
     write_csv(os.path.join(OUT_DIR, "open_positions.csv"), positions_rows)
     write_csv(os.path.join(OUT_DIR, "top_lp.csv"), top_lp_rows)
@@ -711,7 +740,8 @@ def main():
     print_summary(summary_rows)
 
     print("\nSaved:")
-    print(" - state/state.json")
+    print(" - state/sync.json")
+    print(" - state/events.ndjson")
     print(" - out/open_positions.csv")
     print(" - out/top_lp.csv")
     print(" - out/buckets.csv")
