@@ -210,8 +210,14 @@ def decode_int24_topic(topic) -> int:
     return val
 
 
-def decode_mint_or_burn_data(data_hex: str):
-    b = bytes.fromhex(data_hex[2:] if data_hex.startswith("0x") else data_hex)
+def decode_mint_or_burn_data(data_hex):
+    if isinstance(data_hex, (bytes, bytearray)):
+        b = bytes(data_hex)
+    else:
+        s = data_hex.hex() if hasattr(data_hex, "hex") else str(data_hex)
+        s = s[2:] if s.startswith("0x") else s
+        b = bytes.fromhex(s)
+
     liquidity, amount0, amount1 = abi_decode(["uint128", "uint256", "uint256"], b)
     return int(liquidity), int(amount0), int(amount1)
 
