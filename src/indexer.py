@@ -23,7 +23,6 @@ CHAIN_ID = 8453
 POOL = Web3.to_checksum_address("0xbe4C36B9542610dF83Ca690C8b5BC53BbbC5d542")
 FROM_BLOCK = 43139450
 
-# ваши кошельки
 OUR_WALLETS = {
     "0x5f0aea872b7d6dbcc181338f80048b130e443e3b": "our_pool_wallet",
     "0x44a3f0354f4c10eb9cd93e522b5e3210d126f054": "team_mm2",
@@ -32,17 +31,15 @@ OUR_WALLETS = {
 STATE_FILE = "state/state.json"
 OUT_DIR = "out"
 
-# поведение индексатора
-BACKFILL_CHUNK = 5000
-SAFETY_WINDOW_BLOCKS = 50       # небольшой overlap назад
-CONFIRMATIONS_BUFFER = 2        # не трогаем самые последние 2 блока
+BACKFILL_CHUNK = 2000
+SAFETY_WINDOW_BLOCKS = 50
+CONFIRMATIONS_BUFFER = 2
 TIMEOUT = 60
 RETRIES = 6
 RETRY_SLEEP = 1.0
 SLEEP_BETWEEN_CHUNKS = 0.10
 BUCKET_SIZE = 50
 
-# ожидаемые токены
 EXPECTED_TOKEN0 = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower()  # USDC
 EXPECTED_TOKEN1 = "0x9EadbE35F3Ee3bF3e28180070C429298a1b02F93".lower()  # LMTS
 
@@ -82,9 +79,9 @@ pool_c = w3.eth.contract(address=POOL, abi=POOL_ABI)
 # =========================================================
 # TOPICS
 # =========================================================
-MINT_TOPIC0 = "0x" + w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
-BURN_TOPIC0 = "0x" + w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
-INIT_TOPIC0 = "0x" + w3.keccak(text="Initialize(uint160,int24)").hex()
+MINT_TOPIC0 = w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
+BURN_TOPIC0 = w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
+INIT_TOPIC0 = w3.keccak(text="Initialize(uint160,int24)").hex()
 
 # =========================================================
 # MATH
@@ -169,6 +166,32 @@ def rpc_get_logs(params: dict):
     raise last
 
 
+def get_logs_adaptive(from_block: int, to_block: int, topics: list, address: str):
+    """
+    Читает логи по диапазону. Если RPC ругается, делит диапазон пополам.
+    """
+    if from_block > to_block:
+        return []
+
+    params = {
+        "fromBlock": from_block,
+        "toBlock": to_block,
+        "address": Web3.to_checksum_address(address),
+        "topics": [topics],
+    }
+
+    try:
+        return rpc_get_logs(params)
+    except Exception as e:
+        if from_block == to_block:
+            raise e
+
+        mid = (from_block + to_block) // 2
+        left_logs = get_logs_adaptive(from_block, mid, topics, address)
+        right_logs = get_logs_adaptive(mid + 1, to_block, topics, address)
+        return left_logs + right_logs
+
+
 def chunked_range(start_block: int, end_block: int, step: int):
     cur = start_block
     while cur <= end_block:
@@ -186,7 +209,8 @@ def topic_to_address(topic) -> str:
 def decode_int24_topic(topic) -> int:
     raw = topic.hex() if hasattr(topic, "hex") else str(topic)
     raw = raw[2:] if raw.startswith("0x") else raw
-    val = int(raw[-6:], 16)
+    raw_24 = raw[-6:]
+    val = int(raw_24, 16)
     if val >= 2**23:
         val -= 2**24
     return val
@@ -219,9 +243,7 @@ def load_state() -> Dict[str, Any]:
             },
             "sync": {
                 "last_scanned_block": None,
-                "last_scanned_log_index": None,
             },
-            "processed_event_ids": [],
             "positions": {},
         }
 
@@ -286,20 +308,22 @@ def get_scan_range(state: Dict[str, Any], latest_block_safe: int) -> Tuple[int, 
 
 def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: int):
     positions = state["positions"]
-    processed_event_ids = set(state["processed_event_ids"])
 
     total_logs = 0
     total_new_mint = 0
     total_new_burn = 0
     total_init = 0
 
+    # локальный дедуп этого запуска, потому что из-за safety window мы перечитываем overlap
+    seen_event_ids_this_run = set()
+
     for chunk_from, chunk_to in chunked_range(start_block, end_block, BACKFILL_CHUNK):
-        logs = rpc_get_logs({
-            "fromBlock": chunk_from,
-            "toBlock": chunk_to,
-            "address": POOL,
-            "topics": [[MINT_TOPIC0, BURN_TOPIC0, INIT_TOPIC0]],
-        })
+        logs = get_logs_adaptive(
+            from_block=chunk_from,
+            to_block=chunk_to,
+            topics=[MINT_TOPIC0, BURN_TOPIC0, INIT_TOPIC0],
+            address=str(POOL),
+        )
 
         mint_c = 0
         burn_c = 0
@@ -311,14 +335,14 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
             block_number = int(lg["blockNumber"])
             event_id = f"{tx_hash}:{log_index}"
 
-            if event_id in processed_event_ids:
+            if event_id in seen_event_ids_this_run:
                 continue
+            seen_event_ids_this_run.add(event_id)
 
-            topic0 = "0x" + lg["topics"][0].hex()
+            topic0 = lg["topics"][0].hex()
 
             if topic0.lower() == INIT_TOPIC0.lower():
                 init_c += 1
-                processed_event_ids.add(event_id)
                 continue
 
             if len(lg["topics"]) < 4:
@@ -346,6 +370,14 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
                 }
 
             row = positions[key]
+
+            # Защита от overlap: если мы перечитали старый хвост, не хотим еще раз суммировать те же самые события.
+            # Поэтому при overlap мы сначала "обнуляем" состояние только если стартуем не с первого полного запуска.
+            # Но это сложно и ненадежно на row-level, поэтому делаем проще:
+            # если chunk начинается раньше или равен last_scanned_block, то rebuild корректнее делать с нуля.
+            # Однако чтобы не усложнять, используем state только для forward-режима:
+            # overlap допустим, потому что дедуп идет в рамках запуска, а chunk внутри одного запуска не дублируется.
+
             row["last_seen_block"] = block_number
             if row["first_seen_block"] is None:
                 row["first_seen_block"] = block_number
@@ -366,14 +398,9 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
                 row["burn_count"] += 1
                 burn_c += 1
 
-            processed_event_ids.add(event_id)
-
-            # если после burn liquidity стала 0 или меньше — строку не удаляем,
-            # просто оставляем в state как historical, а в exports отфильтруем
             positions[key] = row
 
         state["sync"]["last_scanned_block"] = chunk_to
-        state["sync"]["last_scanned_log_index"] = None
 
         total_logs += len(logs)
         total_new_mint += mint_c
@@ -386,8 +413,6 @@ def process_logs_into_state(state: Dict[str, Any], start_block: int, end_block: 
         )
 
         time.sleep(SLEEP_BETWEEN_CHUNKS)
-
-    state["processed_event_ids"] = sorted(processed_event_ids)
 
     return {
         "logs_scanned_this_run": total_logs,
@@ -433,7 +458,7 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
     sym0 = pool_info["sym0"]
     sym1 = pool_info["sym1"]
 
-    for key, row in state["positions"].items():
+    for _, row in state["positions"].items():
         liquidity_raw = int(row["liquidity_raw"])
         if liquidity_raw <= 0:
             continue
@@ -481,7 +506,6 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
             "burn_count": row["burn_count"],
         })
 
-        # owner aggregation
         ag = owner_aggr[owner]
         ag["owner_label"] = owner_label
         ag["owner_type"] = owner_type
@@ -491,7 +515,6 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
         ag["current_amount0"] += current_amount0
         ag["current_amount1"] += current_amount1
 
-        # buckets: только liquidity
         start_bucket = tick_to_bucket_floor(tick_lower, BUCKET_SIZE)
         end_bucket = tick_to_bucket_floor(tick_upper - 1, BUCKET_SIZE)
 
@@ -510,7 +533,15 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
 
             cur += BUCKET_SIZE
 
-    positions_rows.sort(key=lambda r: (r["owner_type"] != "ours", -int(r["liquidity_raw"]), r["owner"], r["tick_lower"], r["tick_upper"]))
+    positions_rows.sort(
+        key=lambda r: (
+            r["owner_type"] != "ours",
+            -int(r["liquidity_raw"]),
+            r["owner"],
+            r["tick_lower"],
+            r["tick_upper"],
+        )
+    )
 
     top_lp_rows = []
     for owner, ag in owner_aggr.items():
@@ -525,7 +556,13 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
             f"current_{sym1.lower()}": format_dec(ag["current_amount1"], 8),
         })
 
-    top_lp_rows.sort(key=lambda r: (r["owner_type"] != "ours", -int(r["total_liquidity_raw"]), r["owner"]))
+    top_lp_rows.sort(
+        key=lambda r: (
+            r["owner_type"] != "ours",
+            -int(r["total_liquidity_raw"]),
+            r["owner"],
+        )
+    )
 
     bucket_rows = []
     for bucket_low in sorted(bucket_map.keys()):
@@ -575,7 +612,6 @@ def build_exports(state: Dict[str, Any], pool_info: Dict[str, Any]):
         {"metric": f"our_current_{sym1.lower()}", "value": format_dec(our_current_amount1, 8)},
         {"metric": f"external_current_{sym0.lower()}", "value": format_dec(external_current_amount0, 8)},
         {"metric": f"external_current_{sym1.lower()}", "value": format_dec(external_current_amount1, 8)},
-        {"metric": "processed_event_ids_count", "value": len(state["processed_event_ids"])},
     ]
 
     return positions_rows, top_lp_rows, bucket_rows, summary_rows
@@ -627,7 +663,19 @@ def main():
         print("\nWARNING: token0/token1 отличаются от ожидаемых USDC/LMTS.")
         print("Скрипт все равно отработает, но проверь пул.\n")
 
-    start_block, end_block = get_scan_range(state, latest_block_safe)
+    # ВАЖНО:
+    # если уже есть state и ты хочешь корректный incremental через overlap,
+    # текущая простая логика безопасна только если старый overlap не был уже посчитан повторно.
+    # Поэтому для первой корректной версии делаем так:
+    # - первый запуск с нуля
+    # - следующие запуски либо без overlap, либо потом допилим rebuild-from-events.
+    #
+    # Чтобы сейчас не портить state повторным overlap, временно отключаем overlap для persisted-state режима.
+    if state["sync"]["last_scanned_block"] is None:
+        start_block, end_block = FROM_BLOCK, latest_block_safe
+    else:
+        start_block = int(state["sync"]["last_scanned_block"]) + 1
+        end_block = latest_block_safe
 
     if start_block > end_block:
         print("\nNothing new to scan. Rebuilding exports only...")
@@ -642,7 +690,6 @@ def main():
 
         save_state(state)
 
-    # обновляем pool мету в state
     state["meta"]["token0"] = pool_info["token0"]
     state["meta"]["token1"] = pool_info["token1"]
     state["meta"]["token0_symbol"] = pool_info["sym0"]
