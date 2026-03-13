@@ -167,23 +167,20 @@ def get_logs_with_retry(params: dict) -> list:
     if "toBlock" in fixed and isinstance(fixed["toBlock"], int):
         fixed["toBlock"] = hex(fixed["toBlock"])
 
-    import requests as _requests
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_getLogs",
-        "params": [{
-            "fromBlock": fixed["fromBlock"],
-            "toBlock": fixed["toBlock"],
-            "address": fixed["address"],
-            "topics": fixed["topics"],
-        }]
-    }
-    resp = _requests.post(RPC_URL, json=payload, timeout=TIMEOUT)
-    print(f"  [debug] status={resp.status_code} body={resp.text[:500]}")
-    resp.raise_for_status()
-    return []  # временно, просто смотрим ответ
-
+    last = None
+    for attempt in range(RETRIES):
+        try:
+            return w3.eth.get_logs(fixed)
+        except Exception as e:
+            last = e
+            wait = RETRY_SLEEP * (attempt + 1)
+            msg = str(e)
+            if "query returned more than" in msg or "block range" in msg.lower() or "limit exceeded" in msg.lower():
+                raise
+            print(f"  [warn] get_logs failed ({e}), retry in {wait:.1f}s")
+            time.sleep(wait)
+    raise last
+    
 def get_logs_safe(from_block: int, to_block: int, topic: str) -> list:
     """Fetch logs for single topic, splitting recursively if Alchemy complains."""
     if from_block > to_block:
