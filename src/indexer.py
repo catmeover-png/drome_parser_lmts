@@ -161,35 +161,40 @@ def safe_call(fn):
 
 
 def get_logs_with_retry(params: dict) -> list:
+    # Alchemy requires hex strings for block numbers, not integers
+    fixed = dict(params)
+    if "fromBlock" in fixed and isinstance(fixed["fromBlock"], int):
+        fixed["fromBlock"] = hex(fixed["fromBlock"])
+    if "toBlock" in fixed and isinstance(fixed["toBlock"], int):
+        fixed["toBlock"] = hex(fixed["toBlock"])
+
     last = None
     for attempt in range(RETRIES):
         try:
-            return w3.eth.get_logs(params)
+            return w3.eth.get_logs(fixed)
         except Exception as e:
             last = e
             wait = RETRY_SLEEP * (attempt + 1)
             msg = str(e)
-            # Alchemy specific: if range too large, cut in half
-            if "query returned more than" in msg or "block range" in msg.lower():
-                print(f"  [warn] range too large, splitting further")
-                raise  # let caller handle splitting
+            # If range too large — raise immediately so caller can split
+            if "query returned more than" in msg or "block range" in msg.lower() or "limit exceeded" in msg.lower():
+                raise
             print(f"  [warn] get_logs failed ({e}), retry in {wait:.1f}s")
             time.sleep(wait)
     raise last
 
 
 def get_logs_safe(from_block: int, to_block: int, topic: str) -> list:
-    """Fetch logs for single topic, splitting recursively if needed."""
+    """Fetch logs for single topic, splitting recursively if Alchemy complains."""
     if from_block > to_block:
         return []
     try:
-        logs = get_logs_with_retry({
+        return get_logs_with_retry({
             "fromBlock": from_block,
             "toBlock": to_block,
             "address": POOL,
             "topics": [topic],
         })
-        return logs
     except Exception as e:
         if from_block == to_block:
             print(f"  [error] single block {from_block} failed: {e}")
@@ -203,30 +208,39 @@ def get_logs_safe(from_block: int, to_block: int, topic: str) -> list:
 # =========================================================
 # DECODE
 # =========================================================
+def _to_bytes(data) -> bytes:
+    """Normalize HexBytes / str / bytes to plain bytes."""
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    if hasattr(data, "hex"):          # HexBytes from web3
+        return bytes(data)
+    s = str(data)
+    if s.startswith("0x") or s.startswith("0X"):
+        s = s[2:]
+    return bytes.fromhex(s)
+
+
 def topic_to_address(topic) -> str:
-    raw = topic.hex() if hasattr(topic, "hex") else str(topic)
-    raw = raw.lstrip("0x")
+    raw = _to_bytes(topic).hex()      # 32 bytes → 64 hex chars
     return Web3.to_checksum_address("0x" + raw[-40:]).lower()
 
 
 def decode_int24_topic(topic) -> int:
-    raw = topic.hex() if hasattr(topic, "hex") else str(topic)
-    raw = raw.lstrip("0x").zfill(64)
-    raw_24 = raw[-6:]
-    val = int(raw_24, 16)
+    raw = _to_bytes(topic).hex().zfill(64)  # ensure 64 chars
+    val = int(raw[-6:], 16)                 # last 3 bytes = int24
     if val >= 2 ** 23:
         val -= 2 ** 24
     return val
 
 
-def decode_mint_data(data_hex) -> tuple:
-    b = bytes.fromhex(data_hex.hex() if hasattr(data_hex, "hex") else data_hex.lstrip("0x"))
+def decode_mint_data(data) -> tuple:
+    b = _to_bytes(data)
     sender, liquidity, amount0, amount1 = abi_decode(["address", "uint128", "uint256", "uint256"], b)
     return str(sender).lower(), int(liquidity), int(amount0), int(amount1)
 
 
-def decode_burn_data(data_hex) -> tuple:
-    b = bytes.fromhex(data_hex.hex() if hasattr(data_hex, "hex") else data_hex.lstrip("0x"))
+def decode_burn_data(data) -> tuple:
+    b = _to_bytes(data)
     liquidity, amount0, amount1 = abi_decode(["uint128", "uint256", "uint256"], b)
     return int(liquidity), int(amount0), int(amount1)
 
