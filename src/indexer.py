@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Aerodrome LP Indexer
+- First run: full backfill from FROM_BLOCK
+- Subsequent runs: only new blocks since last sync
+- State persisted in state/sync.json + state/events.ndjson
+- Alchemy-compatible: max 2000 blocks per eth_getLogs request
+"""
+
 import os
 import json
 import csv
@@ -32,12 +40,16 @@ SYNC_FILE = os.path.join(STATE_DIR, "sync.json")
 EVENTS_FILE = os.path.join(STATE_DIR, "events.ndjson")
 OUT_DIR = "out"
 
-BACKFILL_CHUNK = 500
-CONFIRMATIONS_BUFFER = 2
-TIMEOUT = 60
-RETRIES = 6
-RETRY_SLEEP = 1.0
-SLEEP_BETWEEN_CHUNKS = 0.05
+# Alchemy allows max 2000 blocks per eth_getLogs
+CHUNK_SIZE = 2000
+
+# Rate limiting
+SLEEP_BETWEEN_CHUNKS = 0.15   # 150ms → ~6 req/s, well within Alchemy free tier
+RETRIES = 5
+RETRY_SLEEP = 2.0
+TIMEOUT = 30
+
+CONFIRMATIONS_BUFFER = 5
 BUCKET_SIZE = 50
 
 EXPECTED_TOKEN0 = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower()  # USDC
@@ -48,7 +60,7 @@ EXPECTED_TOKEN1 = "0x9EadbE35F3Ee3bF3e28180070C429298a1b02F93".lower()  # LMTS
 # =========================================================
 w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": TIMEOUT}))
 if not w3.is_connected():
-    raise RuntimeError("RPC is not connected")
+    raise RuntimeError("RPC not connected — check BASE_RPC_URL secret")
 
 # =========================================================
 # ABIs
@@ -77,11 +89,10 @@ ERC20_ABI = [
 pool_c = w3.eth.contract(address=POOL, abi=POOL_ABI)
 
 # =========================================================
-# TOPICS
+# TOPICS  (each fetched separately — avoids OR ambiguity)
 # =========================================================
-MINT_TOPIC0 = w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
-BURN_TOPIC0 = w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
-INIT_TOPIC0 = w3.keccak(text="Initialize(uint160,int24)").hex()
+MINT_TOPIC = "0x" + w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
+BURN_TOPIC = "0x" + w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
 
 # =========================================================
 # MATH
@@ -90,9 +101,9 @@ Q96 = Decimal(2) ** 96
 D_1_0001 = Decimal("1.0001")
 
 
-def sqrt_price_x96_to_price_token1_per_token0(sqrt_price_x96: int, dec0: int, dec1: int) -> Decimal:
+def sqrt_price_x96_to_price(sqrt_price_x96: int, dec0: int, dec1: int) -> Decimal:
     ratio = (Decimal(sqrt_price_x96) / Q96) ** 2
-    return ratio * (Decimal(10) ** Decimal(dec0 - dec1))
+    return ratio * Decimal(10) ** Decimal(dec0 - dec1)
 
 
 def tick_to_sqrt_price(tick: int) -> Decimal:
@@ -118,123 +129,105 @@ def current_amounts_from_liquidity(liq: int, tick_lower: int, tick_upper: int, s
     return amount0, amount1
 
 
-def human_amount(raw: int | Decimal, decimals: int) -> Decimal:
-    return Decimal(raw) / (Decimal(10) ** Decimal(decimals))
+def human(raw, decimals: int) -> Decimal:
+    return Decimal(raw) / Decimal(10) ** Decimal(decimals)
 
 
-def format_dec(x: Decimal, places: int = 8) -> str:
+def fmt(x: Decimal, places: int = 6) -> str:
     q = Decimal(10) ** -places
     return str(x.quantize(q))
 
 
-def tick_to_bucket_floor(tick: int, bucket_size: int) -> int:
+def tick_to_bucket_floor(tick: int, size: int) -> int:
     if tick >= 0:
-        return (tick // bucket_size) * bucket_size
-    return -(((-tick + bucket_size - 1) // bucket_size) * bucket_size)
+        return (tick // size) * size
+    return -(((-tick + size - 1) // size) * size)
 
 
 # =========================================================
-# HELPERS
+# RPC HELPERS
 # =========================================================
-def ensure_dirs():
-    os.makedirs(STATE_DIR, exist_ok=True)
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-
 def safe_call(fn):
     last = None
-    for _ in range(RETRIES):
+    for attempt in range(RETRIES):
         try:
             return fn.call()
         except Exception as e:
             last = e
-            time.sleep(RETRY_SLEEP)
+            wait = RETRY_SLEEP * (attempt + 1)
+            print(f"  [warn] call failed ({e}), retry in {wait:.1f}s")
+            time.sleep(wait)
     raise last
 
 
-def rpc_get_logs(params: dict):
+def get_logs_with_retry(params: dict) -> list:
     last = None
-    for _ in range(RETRIES):
+    for attempt in range(RETRIES):
         try:
             return w3.eth.get_logs(params)
         except Exception as e:
             last = e
-            time.sleep(RETRY_SLEEP)
+            wait = RETRY_SLEEP * (attempt + 1)
+            msg = str(e)
+            # Alchemy specific: if range too large, cut in half
+            if "query returned more than" in msg or "block range" in msg.lower():
+                print(f"  [warn] range too large, splitting further")
+                raise  # let caller handle splitting
+            print(f"  [warn] get_logs failed ({e}), retry in {wait:.1f}s")
+            time.sleep(wait)
     raise last
 
 
-def get_logs_adaptive(from_block: int, to_block: int, topics: list, address: str):
+def get_logs_safe(from_block: int, to_block: int, topic: str) -> list:
+    """Fetch logs for single topic, splitting recursively if needed."""
     if from_block > to_block:
         return []
-
-    params = {
-        "fromBlock": from_block,
-        "toBlock": to_block,
-        "address": Web3.to_checksum_address(address),
-        "topics": [topics],
-    }
-
     try:
-        return rpc_get_logs(params)
+        logs = get_logs_with_retry({
+            "fromBlock": from_block,
+            "toBlock": to_block,
+            "address": POOL,
+            "topics": [topic],
+        })
+        return logs
     except Exception as e:
         if from_block == to_block:
-            raise e
+            print(f"  [error] single block {from_block} failed: {e}")
+            return []
         mid = (from_block + to_block) // 2
-        return (
-            get_logs_adaptive(from_block, mid, topics, address)
-            + get_logs_adaptive(mid + 1, to_block, topics, address)
-        )
+        left = get_logs_safe(from_block, mid, topic)
+        right = get_logs_safe(mid + 1, to_block, topic)
+        return left + right
 
 
-def chunked_range(start_block: int, end_block: int, step: int):
-    cur = start_block
-    while cur <= end_block:
-        to_block = min(cur + step - 1, end_block)
-        yield cur, to_block
-        cur = to_block + 1
-
-
+# =========================================================
+# DECODE
+# =========================================================
 def topic_to_address(topic) -> str:
     raw = topic.hex() if hasattr(topic, "hex") else str(topic)
-    raw = raw[2:] if raw.startswith("0x") else raw
-    return Web3.to_checksum_address("0x" + raw[-40:])
+    raw = raw.lstrip("0x")
+    return Web3.to_checksum_address("0x" + raw[-40:]).lower()
 
 
 def decode_int24_topic(topic) -> int:
     raw = topic.hex() if hasattr(topic, "hex") else str(topic)
-    raw = raw[2:] if raw.startswith("0x") else raw
+    raw = raw.lstrip("0x").zfill(64)
     raw_24 = raw[-6:]
     val = int(raw_24, 16)
-    if val >= 2**23:
-        val -= 2**24
+    if val >= 2 ** 23:
+        val -= 2 ** 24
     return val
 
 
-def decode_mint_data(data_hex):
-    if isinstance(data_hex, (bytes, bytearray)):
-        b = bytes(data_hex)
-    else:
-        s = data_hex.hex() if hasattr(data_hex, "hex") else str(data_hex)
-        s = s[2:] if s.startswith("0x") else s
-        b = bytes.fromhex(s)
-
-    sender, liquidity, amount0, amount1 = abi_decode(
-        ["address", "uint128", "uint256", "uint256"], b
-    )
+def decode_mint_data(data_hex) -> tuple:
+    b = bytes.fromhex(data_hex.hex() if hasattr(data_hex, "hex") else data_hex.lstrip("0x"))
+    sender, liquidity, amount0, amount1 = abi_decode(["address", "uint128", "uint256", "uint256"], b)
     return str(sender).lower(), int(liquidity), int(amount0), int(amount1)
 
 
-def decode_burn_data(data_hex):
-    if isinstance(data_hex, (bytes, bytearray)):
-        b = bytes(data_hex)
-    else:
-        s = data_hex.hex() if hasattr(data_hex, "hex") else str(data_hex)
-        s = s[2:] if s.startswith("0x") else s
-        b = bytes.fromhex(s)
-
-    liquidity, amount0, amount1 = abi_decode(
-        ["uint128", "uint256", "uint256"], b
-    )
+def decode_burn_data(data_hex) -> tuple:
+    b = bytes.fromhex(data_hex.hex() if hasattr(data_hex, "hex") else data_hex.lstrip("0x"))
+    liquidity, amount0, amount1 = abi_decode(["uint128", "uint256", "uint256"], b)
     return int(liquidity), int(amount0), int(amount1)
 
 
@@ -243,81 +236,38 @@ def position_key(owner: str, tick_lower: int, tick_upper: int) -> str:
 
 
 # =========================================================
-# SYNC
+# STATE
 # =========================================================
-def load_sync():
+def ensure_dirs():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+
+def load_sync() -> dict:
     if not os.path.exists(SYNC_FILE):
-        return {
-            "chain_id": CHAIN_ID,
-            "pool": str(POOL),
-            "last_scanned_block": None,
-        }
-    with open(SYNC_FILE, "r", encoding="utf-8") as f:
+        return {"chain_id": CHAIN_ID, "pool": str(POOL), "last_scanned_block": None}
+    with open(SYNC_FILE, encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_sync(sync):
+def save_sync(sync: dict):
     with open(SYNC_FILE, "w", encoding="utf-8") as f:
         json.dump(sync, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
-# =========================================================
-# POOL INFO
-# =========================================================
-def load_pool_info():
-    token0 = Web3.to_checksum_address(safe_call(pool_c.functions.token0()))
-    token1 = Web3.to_checksum_address(safe_call(pool_c.functions.token1()))
-    tick_spacing = int(safe_call(pool_c.functions.tickSpacing()))
-    fee = int(safe_call(pool_c.functions.fee()))
-    slot0 = safe_call(pool_c.functions.slot0())
-    pool_liquidity = int(safe_call(pool_c.functions.liquidity()))
-
-    sqrt_price_x96 = int(slot0[0])
-    current_tick = int(slot0[1])
-
-    t0 = w3.eth.contract(address=token0, abi=ERC20_ABI)
-    t1 = w3.eth.contract(address=token1, abi=ERC20_ABI)
-
-    dec0 = int(safe_call(t0.functions.decimals()))
-    dec1 = int(safe_call(t1.functions.decimals()))
-    sym0 = safe_call(t0.functions.symbol())
-    sym1 = safe_call(t1.functions.symbol())
-
-    return {
-        "token0": token0,
-        "token1": token1,
-        "dec0": dec0,
-        "dec1": dec1,
-        "sym0": sym0,
-        "sym1": sym1,
-        "tick_spacing": tick_spacing,
-        "fee": fee,
-        "sqrt_price_x96": sqrt_price_x96,
-        "current_tick": current_tick,
-        "current_price_token1_per_token0": sqrt_price_x96_to_price_token1_per_token0(sqrt_price_x96, dec0, dec1),
-        "pool_liquidity_raw": pool_liquidity,
-    }
-
-
-# =========================================================
-# EVENTS STORAGE
-# =========================================================
-def load_existing_event_ids() -> set:
+def load_event_ids() -> set:
     ids = set()
     if not os.path.exists(EVENTS_FILE):
         return ids
-
-    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+    with open(EVENTS_FILE, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            ids.add(obj["event_id"])
+            if line:
+                ids.add(json.loads(line)["event_id"])
     return ids
 
 
-def append_events(events: list[dict]):
+def append_events(events: list):
     if not events:
         return
     with open(EVENTS_FILE, "a", encoding="utf-8") as f:
@@ -326,393 +276,355 @@ def append_events(events: list[dict]):
 
 
 # =========================================================
-# RPC -> EVENTS
+# COLLECT NEW EVENTS  (incremental)
 # =========================================================
-def collect_new_events(sync: dict, latest_block_safe: int):
-    last_scanned_block = sync["last_scanned_block"]
-    start_block = FROM_BLOCK if last_scanned_block is None else int(last_scanned_block) + 1
-    end_block = latest_block_safe
+def collect_events(sync: dict, end_block: int) -> dict:
+    last = sync.get("last_scanned_block")
+    start = FROM_BLOCK if last is None else int(last) + 1
 
-    if start_block > end_block:
-        return {
-            "start_block": start_block,
-            "end_block": end_block,
-            "logs_scanned_this_run": 0,
-            "mint_events_this_run": 0,
-            "burn_events_this_run": 0,
-            "initialize_events_this_run": 0,
-            "new_events_written": 0,
-        }
+    if start > end_block:
+        print(f"Nothing to scan (start={start} > end={end_block})")
+        return {"scanned_blocks": 0, "mint": 0, "burn": 0, "written": 0}
 
-    existing_ids = load_existing_event_ids()
+    total_blocks = end_block - start + 1
+    chunks = list(range(start, end_block + 1, CHUNK_SIZE))
+    total_chunks = len(chunks)
 
-    total_logs = 0
-    total_mint = 0
-    total_burn = 0
-    total_init = 0
-    total_written = 0
+    print(f"Scanning blocks {start} → {end_block} ({total_blocks:,} blocks, {total_chunks} chunks of {CHUNK_SIZE})")
 
-    for chunk_from, chunk_to in chunked_range(start_block, end_block, BACKFILL_CHUNK):
-        logs = get_logs_adaptive(
-            from_block=chunk_from,
-            to_block=chunk_to,
-            topics=[MINT_TOPIC0, BURN_TOPIC0, INIT_TOPIC0],
-            address=str(POOL),
-        )
+    existing_ids = load_event_ids()
+    total_mint = total_burn = total_written = 0
+
+    for i, chunk_start in enumerate(chunks, 1):
+        chunk_end = min(chunk_start + CHUNK_SIZE - 1, end_block)
+
+        mint_logs = get_logs_safe(chunk_start, chunk_end, MINT_TOPIC)
+        burn_logs = get_logs_safe(chunk_start, chunk_end, BURN_TOPIC)
 
         new_events = []
-        mint_c = 0
-        burn_c = 0
-        init_c = 0
 
-        for lg in logs:
-            tx_hash = lg["transactionHash"].hex().lower()
-            log_index = int(lg["logIndex"])
-            block_number = int(lg["blockNumber"])
-            event_id = f"{tx_hash}:{log_index}"
-
-            if event_id in existing_ids:
+        for lg in mint_logs:
+            tx = lg["transactionHash"].hex().lower()
+            idx = int(lg["logIndex"])
+            eid = f"{tx}:{idx}"
+            if eid in existing_ids:
                 continue
-
-            topic0 = lg["topics"][0].hex().lower()
-
-            if topic0 == INIT_TOPIC0.lower():
-                new_events.append({
-                    "event_id": event_id,
-                    "event_type": "initialize",
-                    "block_number": block_number,
-                    "tx_hash": tx_hash,
-                    "log_index": log_index,
-                })
-                existing_ids.add(event_id)
-                init_c += 1
-                continue
-
             if len(lg["topics"]) < 4:
                 continue
-
-            owner = topic_to_address(lg["topics"][1]).lower()
-            tick_lower = decode_int24_topic(lg["topics"][2])
-            tick_upper = decode_int24_topic(lg["topics"][3])
-
-            if topic0 == MINT_TOPIC0.lower():
-                _sender, liq_delta, amount0, amount1 = decode_mint_data(lg["data"])
-                ev_type = "mint"
-                mint_c += 1
-                signed_liq = liq_delta
-
-            elif topic0 == BURN_TOPIC0.lower():
-                liq_delta, amount0, amount1 = decode_burn_data(lg["data"])
-                ev_type = "burn"
-                burn_c += 1
-                signed_liq = -liq_delta
-
-            else:
-                continue
-
+            owner = topic_to_address(lg["topics"][1])
+            tl = decode_int24_topic(lg["topics"][2])
+            tu = decode_int24_topic(lg["topics"][3])
+            _, liq, a0, a1 = decode_mint_data(lg["data"])
             new_events.append({
-                "event_id": event_id,
-                "event_type": ev_type,
-                "block_number": block_number,
-                "tx_hash": tx_hash,
-                "log_index": log_index,
+                "event_id": eid, "event_type": "mint",
+                "block_number": int(lg["blockNumber"]),
+                "tx_hash": tx, "log_index": idx,
                 "owner": owner,
-                "tick_lower": tick_lower,
-                "tick_upper": tick_upper,
-                "liquidity_delta_raw": signed_liq,
-                "amount0_raw": amount0,
-                "amount1_raw": amount1,
+                "tick_lower": tl, "tick_upper": tu,
+                "liquidity_delta_raw": liq,
+                "amount0_raw": a0, "amount1_raw": a1,
             })
-            existing_ids.add(event_id)
+            existing_ids.add(eid)
+            total_mint += 1
+
+        for lg in burn_logs:
+            tx = lg["transactionHash"].hex().lower()
+            idx = int(lg["logIndex"])
+            eid = f"{tx}:{idx}"
+            if eid in existing_ids:
+                continue
+            if len(lg["topics"]) < 4:
+                continue
+            owner = topic_to_address(lg["topics"][1])
+            tl = decode_int24_topic(lg["topics"][2])
+            tu = decode_int24_topic(lg["topics"][3])
+            liq, a0, a1 = decode_burn_data(lg["data"])
+            new_events.append({
+                "event_id": eid, "event_type": "burn",
+                "block_number": int(lg["blockNumber"]),
+                "tx_hash": tx, "log_index": idx,
+                "owner": owner,
+                "tick_lower": tl, "tick_upper": tu,
+                "liquidity_delta_raw": -liq,
+                "amount0_raw": a0, "amount1_raw": a1,
+            })
+            existing_ids.add(eid)
+            total_burn += 1
 
         append_events(new_events)
-        sync["last_scanned_block"] = chunk_to
-        save_sync(sync)
-
-        total_logs += len(logs)
-        total_mint += mint_c
-        total_burn += burn_c
-        total_init += init_c
         total_written += len(new_events)
 
-        print(
-            f"scanned {chunk_from}-{chunk_to} | "
-            f"logs={len(logs)} mint={mint_c} burn={burn_c} init={init_c} written={len(new_events)}"
-        )
+        # Save progress after every chunk — if job is killed, we resume from here
+        sync["last_scanned_block"] = chunk_end
+        save_sync(sync)
+
+        if i % 20 == 0 or i == total_chunks:
+            pct = i / total_chunks * 100
+            print(f"  chunk {i}/{total_chunks} ({pct:.0f}%) block {chunk_end} | "
+                  f"mint={total_mint} burn={total_burn} written={total_written}")
+
         time.sleep(SLEEP_BETWEEN_CHUNKS)
 
     return {
-        "start_block": start_block,
-        "end_block": end_block,
-        "logs_scanned_this_run": total_logs,
-        "mint_events_this_run": total_mint,
-        "burn_events_this_run": total_burn,
-        "initialize_events_this_run": total_init,
-        "new_events_written": total_written,
+        "scanned_blocks": total_blocks,
+        "mint": total_mint,
+        "burn": total_burn,
+        "written": total_written,
     }
 
-# =========================================================
-# EVENTS -> SNAPSHOT
-# =========================================================
-def rebuild_positions_from_events():
-    positions = {}
 
+# =========================================================
+# REBUILD POSITIONS
+# =========================================================
+def rebuild_positions() -> dict:
+    positions = {}
     if not os.path.exists(EVENTS_FILE):
         return positions
 
-    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+    with open(EVENTS_FILE, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             ev = json.loads(line)
-
             if ev["event_type"] not in ("mint", "burn"):
                 continue
 
             owner = ev["owner"]
-            tick_lower = int(ev["tick_lower"])
-            tick_upper = int(ev["tick_upper"])
-            key = position_key(owner, tick_lower, tick_upper)
+            tl = int(ev["tick_lower"])
+            tu = int(ev["tick_upper"])
+            key = position_key(owner, tl, tu)
 
             if key not in positions:
                 positions[key] = {
                     "owner": owner,
-                    "tick_lower": tick_lower,
-                    "tick_upper": tick_upper,
+                    "tick_lower": tl, "tick_upper": tu,
                     "liquidity_raw": 0,
-                    "minted_amount0_raw": 0,
-                    "minted_amount1_raw": 0,
-                    "burned_amount0_raw": 0,
-                    "burned_amount1_raw": 0,
+                    "minted_amount0_raw": 0, "minted_amount1_raw": 0,
+                    "burned_amount0_raw": 0, "burned_amount1_raw": 0,
                     "first_seen_block": ev["block_number"],
                     "last_seen_block": ev["block_number"],
-                    "mint_count": 0,
-                    "burn_count": 0,
+                    "mint_count": 0, "burn_count": 0,
                 }
 
             row = positions[key]
-            row["last_seen_block"] = max(int(row["last_seen_block"]), int(ev["block_number"]))
-            row["first_seen_block"] = min(int(row["first_seen_block"]), int(ev["block_number"]))
+            row["first_seen_block"] = min(row["first_seen_block"], ev["block_number"])
+            row["last_seen_block"] = max(row["last_seen_block"], ev["block_number"])
 
             liq_delta = int(ev["liquidity_delta_raw"])
-            amount0 = int(ev["amount0_raw"])
-            amount1 = int(ev["amount1_raw"])
-
+            a0 = int(ev["amount0_raw"])
+            a1 = int(ev["amount1_raw"])
             row["liquidity_raw"] += liq_delta
 
             if ev["event_type"] == "mint":
-                row["minted_amount0_raw"] += amount0
-                row["minted_amount1_raw"] += amount1
+                row["minted_amount0_raw"] += a0
+                row["minted_amount1_raw"] += a1
                 row["mint_count"] += 1
             else:
-                row["burned_amount0_raw"] += amount0
-                row["burned_amount1_raw"] += amount1
+                row["burned_amount0_raw"] += a0
+                row["burned_amount1_raw"] += a1
                 row["burn_count"] += 1
-
-            positions[key] = row
 
     return positions
 
 
 # =========================================================
-# EXPORTS
+# POOL INFO
+# =========================================================
+def load_pool_info() -> dict:
+    token0 = Web3.to_checksum_address(safe_call(pool_c.functions.token0()))
+    token1 = Web3.to_checksum_address(safe_call(pool_c.functions.token1()))
+    tick_spacing = int(safe_call(pool_c.functions.tickSpacing()))
+    fee = int(safe_call(pool_c.functions.fee()))
+    slot0 = safe_call(pool_c.functions.slot0())
+    pool_liq = int(safe_call(pool_c.functions.liquidity()))
+
+    sqrt_price_x96 = int(slot0[0])
+    current_tick = int(slot0[1])
+
+    t0 = w3.eth.contract(address=token0, abi=ERC20_ABI)
+    t1 = w3.eth.contract(address=token1, abi=ERC20_ABI)
+    dec0 = int(safe_call(t0.functions.decimals()))
+    dec1 = int(safe_call(t1.functions.decimals()))
+    sym0 = safe_call(t0.functions.symbol())
+    sym1 = safe_call(t1.functions.symbol())
+
+    return {
+        "token0": token0, "token1": token1,
+        "dec0": dec0, "dec1": dec1,
+        "sym0": sym0, "sym1": sym1,
+        "tick_spacing": tick_spacing, "fee": fee,
+        "sqrt_price_x96": sqrt_price_x96,
+        "current_tick": current_tick,
+        "price_token1_per_token0": sqrt_price_x96_to_price(sqrt_price_x96, dec0, dec1),
+        "pool_liquidity_raw": pool_liq,
+    }
+
+
+# =========================================================
+# BUILD CSV EXPORTS
 # =========================================================
 def build_exports(positions: dict, pool_info: dict):
+    sym0 = pool_info["sym0"].lower()
+    sym1 = pool_info["sym1"].lower()
+    dec0 = pool_info["dec0"]
+    dec1 = pool_info["dec1"]
+    current_tick = pool_info["current_tick"]
+    sqrt_price_x96 = pool_info["sqrt_price_x96"]
+
     positions_rows = []
     owner_aggr = defaultdict(lambda: {
-        "owner_label": "external",
-        "owner_type": "external",
-        "total_liquidity_raw": 0,
-        "positions_count": 0,
-        "active_positions_count": 0,
-        "current_amount0": Decimal(0),
-        "current_amount1": Decimal(0),
+        "label": "external", "type": "external",
+        "liquidity_raw": 0, "positions": 0, "in_range": 0,
+        "cur0": Decimal(0), "cur1": Decimal(0),
     })
-
     bucket_map = defaultdict(lambda: {
-        "total_liquidity_raw": 0,
-        "our_liquidity_raw": 0,
-        "external_liquidity_raw": 0,
-        "positions_count": 0,
-        "our_positions_count": 0,
-        "external_positions_count": 0,
+        "liq": 0, "our_liq": 0, "ext_liq": 0,
+        "pos": 0, "our_pos": 0, "ext_pos": 0,
         "owners": set(),
     })
 
-    our_total_liquidity_raw = 0
-    external_total_liquidity_raw = 0
-    our_current_amount0 = Decimal(0)
-    our_current_amount1 = Decimal(0)
-    external_current_amount0 = Decimal(0)
-    external_current_amount1 = Decimal(0)
+    our_liq = 0; ext_liq = 0
+    our_cur0 = Decimal(0); our_cur1 = Decimal(0)
+    ext_cur0 = Decimal(0); ext_cur1 = Decimal(0)
 
-    current_tick = pool_info["current_tick"]
-    sqrt_price_x96 = pool_info["sqrt_price_x96"]
-    dec0 = pool_info["dec0"]
-    dec1 = pool_info["dec1"]
-    sym0 = pool_info["sym0"]
-    sym1 = pool_info["sym1"]
-
-    for _, row in positions.items():
-        liquidity_raw = int(row["liquidity_raw"])
-        if liquidity_raw <= 0:
+    for row in positions.values():
+        liq = int(row["liquidity_raw"])
+        if liq <= 0:
             continue
 
         owner = row["owner"].lower()
-        owner_label = OUR_WALLETS.get(owner, "external")
-        owner_type = "ours" if owner in OUR_WALLETS else "external"
-        tick_lower = int(row["tick_lower"])
-        tick_upper = int(row["tick_upper"])
-        in_range = tick_lower <= current_tick < tick_upper
+        label = OUR_WALLETS.get(owner, "external")
+        otype = "ours" if owner in OUR_WALLETS else "external"
+        tl = int(row["tick_lower"])
+        tu = int(row["tick_upper"])
+        in_range = tl <= current_tick < tu
 
-        amt0_raw_dec, amt1_raw_dec = current_amounts_from_liquidity(
-            liquidity_raw, tick_lower, tick_upper, sqrt_price_x96
-        )
-        current_amount0 = human_amount(amt0_raw_dec, dec0)
-        current_amount1 = human_amount(amt1_raw_dec, dec1)
+        cur0_dec, cur1_dec = current_amounts_from_liquidity(liq, tl, tu, sqrt_price_x96)
+        cur0 = human(cur0_dec, dec0)
+        cur1 = human(cur1_dec, dec1)
 
-        if owner_type == "ours":
-            our_total_liquidity_raw += liquidity_raw
-            our_current_amount0 += current_amount0
-            our_current_amount1 += current_amount1
+        net0 = human(row["minted_amount0_raw"] - row["burned_amount0_raw"], dec0)
+        net1 = human(row["minted_amount1_raw"] - row["burned_amount1_raw"], dec1)
+
+        if otype == "ours":
+            our_liq += liq; our_cur0 += cur0; our_cur1 += cur1
         else:
-            external_total_liquidity_raw += liquidity_raw
-            external_current_amount0 += current_amount0
-            external_current_amount1 += current_amount1
+            ext_liq += liq; ext_cur0 += cur0; ext_cur1 += cur1
 
         positions_rows.append({
             "owner": owner,
-            "owner_label": owner_label,
-            "owner_type": owner_type,
-            "tick_lower": tick_lower,
-            "tick_upper": tick_upper,
-            "width_ticks": tick_upper - tick_lower,
-            "liquidity_raw": liquidity_raw,
+            "label": label,
+            "type": otype,
+            "tick_lower": tl,
+            "tick_upper": tu,
+            "width_ticks": tu - tl,
+            "liquidity": liq,
             "in_range": in_range,
-            f"current_{sym0.lower()}": format_dec(current_amount0, 8),
-            f"current_{sym1.lower()}": format_dec(current_amount1, 8),
-            f"minted_{sym0.lower()}": format_dec(human_amount(int(row["minted_amount0_raw"]), dec0), 8),
-            f"minted_{sym1.lower()}": format_dec(human_amount(int(row["minted_amount1_raw"]), dec1), 8),
-            f"burned_{sym0.lower()}": format_dec(human_amount(int(row["burned_amount0_raw"]), dec0), 8),
-            f"burned_{sym1.lower()}": format_dec(human_amount(int(row["burned_amount1_raw"]), dec1), 8),
-            "first_seen_block": row["first_seen_block"],
-            "last_seen_block": row["last_seen_block"],
+            f"cur_{sym0}": fmt(cur0),
+            f"cur_{sym1}": fmt(cur1),
+            f"net_{sym0}": fmt(net0),
+            f"net_{sym1}": fmt(net1),
+            f"minted_{sym0}": fmt(human(row["minted_amount0_raw"], dec0)),
+            f"minted_{sym1}": fmt(human(row["minted_amount1_raw"], dec1)),
+            f"burned_{sym0}": fmt(human(row["burned_amount0_raw"], dec0)),
+            f"burned_{sym1}": fmt(human(row["burned_amount1_raw"], dec1)),
             "mint_count": row["mint_count"],
             "burn_count": row["burn_count"],
+            "first_block": row["first_seen_block"],
+            "last_block": row["last_seen_block"],
         })
 
         ag = owner_aggr[owner]
-        ag["owner_label"] = owner_label
-        ag["owner_type"] = owner_type
-        ag["total_liquidity_raw"] += liquidity_raw
-        ag["positions_count"] += 1
-        ag["active_positions_count"] += 1 if in_range else 0
-        ag["current_amount0"] += current_amount0
-        ag["current_amount1"] += current_amount1
+        ag["label"] = label; ag["type"] = otype
+        ag["liquidity_raw"] += liq; ag["positions"] += 1
+        ag["in_range"] += 1 if in_range else 0
+        ag["cur0"] += cur0; ag["cur1"] += cur1
 
-        start_bucket = tick_to_bucket_floor(tick_lower, BUCKET_SIZE)
-        end_bucket = tick_to_bucket_floor(tick_upper - 1, BUCKET_SIZE)
-
-        cur = start_bucket
-        while cur <= end_bucket:
-            bucket_map[cur]["total_liquidity_raw"] += liquidity_raw
-            bucket_map[cur]["positions_count"] += 1
-            bucket_map[cur]["owners"].add(owner)
-
-            if owner_type == "ours":
-                bucket_map[cur]["our_liquidity_raw"] += liquidity_raw
-                bucket_map[cur]["our_positions_count"] += 1
+        # bucket distribution
+        b_start = tick_to_bucket_floor(tl, BUCKET_SIZE)
+        b_end = tick_to_bucket_floor(tu - 1, BUCKET_SIZE)
+        b = b_start
+        while b <= b_end:
+            bm = bucket_map[b]
+            bm["liq"] += liq; bm["pos"] += 1; bm["owners"].add(owner)
+            if otype == "ours":
+                bm["our_liq"] += liq; bm["our_pos"] += 1
             else:
-                bucket_map[cur]["external_liquidity_raw"] += liquidity_raw
-                bucket_map[cur]["external_positions_count"] += 1
+                bm["ext_liq"] += liq; bm["ext_pos"] += 1
+            b += BUCKET_SIZE
 
-            cur += BUCKET_SIZE
-
-    positions_rows.sort(key=lambda r: (r["owner_type"] != "ours", -int(r["liquidity_raw"]), r["owner"], r["tick_lower"], r["tick_upper"]))
+    positions_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"], r["owner"]))
 
     top_lp_rows = []
     for owner, ag in owner_aggr.items():
         top_lp_rows.append({
-            "owner": owner,
-            "owner_label": ag["owner_label"],
-            "owner_type": ag["owner_type"],
-            "total_liquidity_raw": ag["total_liquidity_raw"],
-            "positions_count": ag["positions_count"],
-            "active_positions_count": ag["active_positions_count"],
-            f"current_{sym0.lower()}": format_dec(ag["current_amount0"], 8),
-            f"current_{sym1.lower()}": format_dec(ag["current_amount1"], 8),
+            "owner": owner, "label": ag["label"], "type": ag["type"],
+            "liquidity": ag["liquidity_raw"],
+            "positions": ag["positions"],
+            "in_range_positions": ag["in_range"],
+            f"cur_{sym0}": fmt(ag["cur0"]),
+            f"cur_{sym1}": fmt(ag["cur1"]),
         })
-
-    top_lp_rows.sort(key=lambda r: (r["owner_type"] != "ours", -int(r["total_liquidity_raw"]), r["owner"]))
+    top_lp_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"]))
 
     bucket_rows = []
-    for bucket_low in sorted(bucket_map.keys()):
+    for bk in sorted(bucket_map):
+        bm = bucket_map[bk]
         bucket_rows.append({
-            "bucket_tick_lower": bucket_low,
-            "bucket_tick_upper": bucket_low + BUCKET_SIZE,
-            "total_liquidity_raw": bucket_map[bucket_low]["total_liquidity_raw"],
-            "our_liquidity_raw": bucket_map[bucket_low]["our_liquidity_raw"],
-            "external_liquidity_raw": bucket_map[bucket_low]["external_liquidity_raw"],
-            "positions_count": bucket_map[bucket_low]["positions_count"],
-            "our_positions_count": bucket_map[bucket_low]["our_positions_count"],
-            "external_positions_count": bucket_map[bucket_low]["external_positions_count"],
-            "owners_count": len(bucket_map[bucket_low]["owners"]),
-            "contains_current_tick": bucket_low <= current_tick < bucket_low + BUCKET_SIZE,
+            "tick_lower": bk, "tick_upper": bk + BUCKET_SIZE,
+            "liquidity": bm["liq"],
+            "our_liquidity": bm["our_liq"],
+            "ext_liquidity": bm["ext_liq"],
+            "positions": bm["pos"],
+            "our_positions": bm["our_pos"],
+            "ext_positions": bm["ext_pos"],
+            "unique_owners": len(bm["owners"]),
+            "is_current_tick": bk <= current_tick < bk + BUCKET_SIZE,
         })
 
-    unique_owners = len(owner_aggr)
-    open_positions_count = len(positions_rows)
-    our_open_positions_count = sum(1 for r in positions_rows if r["owner_type"] == "ours")
-    external_open_positions_count = sum(1 for r in positions_rows if r["owner_type"] == "external")
-    positions_in_range_count = sum(1 for r in positions_rows if r["in_range"])
+    open_pos = len(positions_rows)
+    in_range_pos = sum(1 for r in positions_rows if r["in_range"])
 
     summary_rows = [
-        {"metric": "chain_id", "value": CHAIN_ID},
         {"metric": "pool", "value": str(POOL)},
+        {"metric": "chain_id", "value": CHAIN_ID},
         {"metric": "from_block", "value": FROM_BLOCK},
-        {"metric": "token0_symbol", "value": sym0},
-        {"metric": "token1_symbol", "value": sym1},
-        {"metric": "token0_address", "value": pool_info["token0"]},
-        {"metric": "token1_address", "value": pool_info["token1"]},
-        {"metric": "token0_decimals", "value": dec0},
-        {"metric": "token1_decimals", "value": dec1},
-        {"metric": "tick_spacing", "value": pool_info["tick_spacing"]},
+        {"metric": f"token0_{sym0}", "value": pool_info["token0"]},
+        {"metric": f"token1_{sym1}", "value": pool_info["token1"]},
+        {"metric": "dec0", "value": dec0},
+        {"metric": "dec1", "value": dec1},
         {"metric": "fee", "value": pool_info["fee"]},
+        {"metric": "tick_spacing", "value": pool_info["tick_spacing"]},
         {"metric": "current_tick", "value": current_tick},
-        {"metric": f"price_{sym1}_per_1_{sym0}", "value": str(pool_info["current_price_token1_per_token0"])},
+        {"metric": f"price_{sym1}_per_{sym0}", "value": fmt(pool_info["price_token1_per_token0"], 8)},
         {"metric": "pool_liquidity_raw", "value": pool_info["pool_liquidity_raw"]},
-        {"metric": "open_positions_count", "value": open_positions_count},
-        {"metric": "unique_owners_count", "value": unique_owners},
-        {"metric": "positions_in_range_count", "value": positions_in_range_count},
-        {"metric": "our_open_positions_count", "value": our_open_positions_count},
-        {"metric": "external_open_positions_count", "value": external_open_positions_count},
-        {"metric": "our_total_liquidity_raw", "value": our_total_liquidity_raw},
-        {"metric": "external_total_liquidity_raw", "value": external_total_liquidity_raw},
-        {"metric": f"our_current_{sym0.lower()}", "value": format_dec(our_current_amount0, 8)},
-        {"metric": f"our_current_{sym1.lower()}", "value": format_dec(our_current_amount1, 8)},
-        {"metric": f"external_current_{sym0.lower()}", "value": format_dec(external_current_amount0, 8)},
-        {"metric": f"external_current_{sym1.lower()}", "value": format_dec(external_current_amount1, 8)},
+        {"metric": "open_positions", "value": open_pos},
+        {"metric": "in_range_positions", "value": in_range_pos},
+        {"metric": "unique_owners", "value": len(owner_aggr)},
+        {"metric": "our_positions", "value": sum(1 for r in positions_rows if r["type"] == "ours")},
+        {"metric": "our_liquidity", "value": our_liq},
+        {"metric": "ext_liquidity", "value": ext_liq},
+        {"metric": f"our_cur_{sym0}", "value": fmt(our_cur0)},
+        {"metric": f"our_cur_{sym1}", "value": fmt(our_cur1)},
+        {"metric": f"ext_cur_{sym0}", "value": fmt(ext_cur0)},
+        {"metric": f"ext_cur_{sym1}", "value": fmt(ext_cur1)},
     ]
 
     return positions_rows, top_lp_rows, bucket_rows, summary_rows
 
 
-def write_csv(path: str, rows: list, fieldnames: list | None = None):
-    if fieldnames is None:
-        fieldnames = list(rows[0].keys()) if rows else []
+# =========================================================
+# CSV WRITER
+# =========================================================
+def write_csv(path: str, rows: list, fieldnames: list = None):
+    fieldnames = fieldnames or (list(rows[0].keys()) if rows else [])
     with open(path, "w", newline="", encoding="utf-8") as f:
-        if fieldnames:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            if rows:
-                w.writerows(rows)
-
-
-def print_summary(summary_rows):
-    print("\n=== SUMMARY ===")
-    for row in summary_rows:
-        print(f"{row['metric']}: {row['value']}")
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        if rows:
+            w.writerows(rows)
+    print(f"  → {path} ({len(rows)} rows)")
 
 
 # =========================================================
@@ -721,55 +633,66 @@ def print_summary(summary_rows):
 def main():
     ensure_dirs()
 
-    latest_block = int(w3.eth.block_number)
-    latest_block_safe = latest_block - CONFIRMATIONS_BUFFER
-    if latest_block_safe < FROM_BLOCK:
-        raise RuntimeError("latest_block_safe < FROM_BLOCK")
+    latest = int(w3.eth.block_number)
+    end_block = latest - CONFIRMATIONS_BUFFER
+    if end_block < FROM_BLOCK:
+        raise RuntimeError(f"end_block ({end_block}) < FROM_BLOCK ({FROM_BLOCK})")
 
     sync = load_sync()
     pool_info = load_pool_info()
 
-    print("=== POOL INFO ===")
-    print(f"Pool:               {POOL}")
-    print(f"Latest block:       {latest_block}")
-    print(f"Latest safe block:  {latest_block_safe}")
-    print(f"From block:         {FROM_BLOCK}")
-    print(f"Token0:             {pool_info['sym0']} ({pool_info['token0']}) decimals={pool_info['dec0']}")
-    print(f"Token1:             {pool_info['sym1']} ({pool_info['token1']}) decimals={pool_info['dec1']}")
-    print(f"Tick spacing:       {pool_info['tick_spacing']}")
-    print(f"Fee:                {pool_info['fee']}")
-    print(f"Current tick:       {pool_info['current_tick']}")
-    print(f"Pool liquidity raw: {pool_info['pool_liquidity_raw']}")
-    print(f"Price {pool_info['sym1']} per 1 {pool_info['sym0']}: {pool_info['current_price_token1_per_token0']}")
+    print("=" * 60)
+    print("POOL INFO")
+    print("=" * 60)
+    print(f"Pool:          {POOL}")
+    print(f"Tokens:        {pool_info['sym0']} / {pool_info['sym1']}")
+    print(f"Fee:           {pool_info['fee']}  tick_spacing: {pool_info['tick_spacing']}")
+    print(f"Current tick:  {pool_info['current_tick']}")
+    print(f"Price {pool_info['sym1']}/{pool_info['sym0']}: {fmt(pool_info['price_token1_per_token0'], 8)}")
+    print(f"Pool liq raw:  {pool_info['pool_liquidity_raw']:,}")
+    print(f"Latest block:  {latest}  safe: {end_block}")
+    last = sync.get("last_scanned_block")
+    print(f"Last synced:   {last if last else 'never (first run)'}")
+    print()
 
-    if pool_info["token0"].lower() != EXPECTED_TOKEN0 or pool_info["token1"].lower() != EXPECTED_TOKEN1:
-        print("\nWARNING: token0/token1 отличаются от ожидаемых USDC/LMTS.\n")
+    if pool_info["token0"].lower() != EXPECTED_TOKEN0:
+        print(f"WARNING: token0 mismatch! got {pool_info['token0']}")
+    if pool_info["token1"].lower() != EXPECTED_TOKEN1:
+        print(f"WARNING: token1 mismatch! got {pool_info['token1']}")
 
-    print("\n=== COLLECT EVENTS ===")
-    run_stats = collect_new_events(sync, latest_block_safe)
-    for k, v in run_stats.items():
-        print(f"{k}: {v}")
+    print("=" * 60)
+    print("COLLECTING EVENTS")
+    print("=" * 60)
+    stats = collect_events(sync, end_block)
+    for k, v in stats.items():
+        print(f"  {k}: {v:,}" if isinstance(v, int) else f"  {k}: {v}")
 
-    print("\n=== REBUILD SNAPSHOT FROM EVENTS ===")
-    positions = rebuild_positions_from_events()
-    print(f"positions_rebuilt_total_keys: {len(positions)}")
+    print()
+    print("=" * 60)
+    print("REBUILDING SNAPSHOT")
+    print("=" * 60)
+    positions = rebuild_positions()
+    active = sum(1 for r in positions.values() if r["liquidity_raw"] > 0)
+    print(f"  total position keys: {len(positions):,}")
+    print(f"  active (liq > 0):    {active:,}")
 
-    positions_rows, top_lp_rows, bucket_rows, summary_rows = build_exports(positions, pool_info)
+    print()
+    print("=" * 60)
+    print("WRITING EXPORTS")
+    print("=" * 60)
+    pos_rows, lp_rows, bucket_rows, summary_rows = build_exports(positions, pool_info)
 
-    write_csv(os.path.join(OUT_DIR, "open_positions.csv"), positions_rows)
-    write_csv(os.path.join(OUT_DIR, "top_lp.csv"), top_lp_rows)
-    write_csv(os.path.join(OUT_DIR, "buckets.csv"), bucket_rows)
-    write_csv(os.path.join(OUT_DIR, "summary.csv"), summary_rows, fieldnames=["metric", "value"])
+    write_csv(f"{OUT_DIR}/open_positions.csv", pos_rows)
+    write_csv(f"{OUT_DIR}/top_lp.csv", lp_rows)
+    write_csv(f"{OUT_DIR}/buckets.csv", bucket_rows)
+    write_csv(f"{OUT_DIR}/summary.csv", summary_rows, fieldnames=["metric", "value"])
 
-    print_summary(summary_rows)
+    print()
+    print("=== SUMMARY ===")
+    for row in summary_rows:
+        print(f"  {row['metric']}: {row['value']}")
 
-    print("\nSaved:")
-    print(" - state/sync.json")
-    print(" - state/events.ndjson")
-    print(" - out/open_positions.csv")
-    print(" - out/top_lp.csv")
-    print(" - out/buckets.csv")
-    print(" - out/summary.csv")
+    print("\nDONE")
 
 
 if __name__ == "__main__":
