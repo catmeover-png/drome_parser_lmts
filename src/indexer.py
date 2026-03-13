@@ -210,7 +210,7 @@ def decode_int24_topic(topic) -> int:
     return val
 
 
-def decode_mint_or_burn_data(data_hex):
+def decode_mint_data(data_hex):
     if isinstance(data_hex, (bytes, bytearray)):
         b = bytes(data_hex)
     else:
@@ -218,7 +218,23 @@ def decode_mint_or_burn_data(data_hex):
         s = s[2:] if s.startswith("0x") else s
         b = bytes.fromhex(s)
 
-    liquidity, amount0, amount1 = abi_decode(["uint128", "uint256", "uint256"], b)
+    sender, liquidity, amount0, amount1 = abi_decode(
+        ["address", "uint128", "uint256", "uint256"], b
+    )
+    return str(sender).lower(), int(liquidity), int(amount0), int(amount1)
+
+
+def decode_burn_data(data_hex):
+    if isinstance(data_hex, (bytes, bytearray)):
+        b = bytes(data_hex)
+    else:
+        s = data_hex.hex() if hasattr(data_hex, "hex") else str(data_hex)
+        s = s[2:] if s.startswith("0x") else s
+        b = bytes.fromhex(s)
+
+    liquidity, amount0, amount1 = abi_decode(
+        ["uint128", "uint256", "uint256"], b
+    )
     return int(liquidity), int(amount0), int(amount1)
 
 
@@ -378,16 +394,19 @@ def collect_new_events(sync: dict, latest_block_safe: int):
             owner = topic_to_address(lg["topics"][1]).lower()
             tick_lower = decode_int24_topic(lg["topics"][2])
             tick_upper = decode_int24_topic(lg["topics"][3])
-            liq_delta, amount0, amount1 = decode_mint_or_burn_data(lg["data"])
 
             if topic0 == MINT_TOPIC0.lower():
+                _sender, liq_delta, amount0, amount1 = decode_mint_data(lg["data"])
                 ev_type = "mint"
                 mint_c += 1
                 signed_liq = liq_delta
+
             elif topic0 == BURN_TOPIC0.lower():
+                liq_delta, amount0, amount1 = decode_burn_data(lg["data"])
                 ev_type = "burn"
                 burn_c += 1
                 signed_liq = -liq_delta
+
             else:
                 continue
 
@@ -431,7 +450,6 @@ def collect_new_events(sync: dict, latest_block_safe: int):
         "initialize_events_this_run": total_init,
         "new_events_written": total_written,
     }
-
 
 # =========================================================
 # EVENTS -> SNAPSHOT
