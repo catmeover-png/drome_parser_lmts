@@ -179,7 +179,10 @@ def get_logs_with_retry(params: dict) -> list:
             # If range too large — raise immediately so caller can split
             if "query returned more than" in msg or "block range" in msg.lower() or "limit exceeded" in msg.lower():
                 raise
-            print(f"  [warn] get_logs failed ({e}), retry in {wait:.1f}s")
+            import traceback
+            print(f"  [warn] get_logs failed: {type(e).__name__}: {e}")
+            print(f"  [warn] full error: {traceback.format_exc()}")
+
             time.sleep(wait)
     raise last
 
