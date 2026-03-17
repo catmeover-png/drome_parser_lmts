@@ -2,17 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-Aerodrome LP Indexer
+Aerodrome LP Indexer (Base)
 - First run: full backfill from FROM_BLOCK
 - Subsequent runs: only new blocks since last sync
-- State persisted in state/sync.json + state/events.ndjson
-- Alchemy-compatible: max 2000 blocks per eth_getLogs request
+- State persisted in state/<pool>/sync.json + events.ndjson
+- TokenId tracked via NPM IncreaseLiquidity events
+- Current owner resolved via NPM.ownerOf(tokenId) eth_call at end of run
+- Minter tracked in state/<pool>/token_ids.json (preserved across runs)
+- Exports CSV files into out/<pool>/
+- Google Sheets export: aero_positions, aero_buckets, aero_summary, aero_snapshots
 """
 
 import os
 import json
 import csv
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, getcontext
 from collections import defaultdict
 
@@ -30,25 +35,31 @@ CHAIN_ID = 8453
 POOL = Web3.to_checksum_address("0xbe4C36B9542610dF83Ca690C8b5BC53BbbC5d542")
 FROM_BLOCK = 43139450
 
+# Uniswap V3 NonfungiblePositionManager on Base (same contract used by Aerodrome CL)
+NPM = Web3.to_checksum_address("0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1")
+
 OUR_WALLETS = {
     "0x5f0aea872b7d6dbcc181338f80048b130e443e3b": "our_pool_wallet",
     "0x44a3f0354f4c10eb9cd93e522b5e3210d126f054": "team_mm2",
 }
 
-STATE_DIR = "state"
+# Google Sheets — separate spreadsheet from Uniswap indexer
+SPREADSHEET_ID = os.environ.get("AERO_SPREADSHEET_ID", "")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")
+
+POOL_ID = POOL.lower()
+STATE_DIR = os.path.join("state", POOL_ID)
 SYNC_FILE = os.path.join(STATE_DIR, "sync.json")
 EVENTS_FILE = os.path.join(STATE_DIR, "events.ndjson")
-OUT_DIR = "out"
+TOKEN_IDS_FILE = os.path.join(STATE_DIR, "token_ids.json")
+OUT_DIR = os.path.join("out", POOL_ID)
 
 # Alchemy allows max 2000 blocks per eth_getLogs
 CHUNK_SIZE = 2000
-
-# Rate limiting
-SLEEP_BETWEEN_CHUNKS = 0.15   # 150ms → ~6 req/s, well within Alchemy free tier
+SLEEP_BETWEEN_CHUNKS = 0.15
 RETRIES = 5
 RETRY_SLEEP = 2.0
 TIMEOUT = 30
-
 CONFIRMATIONS_BUFFER = 5
 BUCKET_SIZE = 50
 
@@ -86,13 +97,27 @@ ERC20_ABI = [
     {"name": "symbol", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"type": "string"}]},
 ]
 
+NPM_ABI = [
+    {
+        "name": "ownerOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "outputs": [{"type": "address"}],
+    },
+]
+
 pool_c = w3.eth.contract(address=POOL, abi=POOL_ABI)
+npm_c = w3.eth.contract(address=NPM, abi=NPM_ABI)
 
 # =========================================================
-# TOPICS  (each fetched separately — avoids OR ambiguity)
+# TOPICS
 # =========================================================
 MINT_TOPIC = "0x" + w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
 BURN_TOPIC = "0x" + w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
+
+# NPM: IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)
+INCREASE_LIQUIDITY_TOPIC = w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
 
 # =========================================================
 # MATH
@@ -180,16 +205,18 @@ def get_logs_with_retry(params: dict) -> list:
             print(f"  [warn] get_logs failed ({e}), retry in {wait:.1f}s")
             time.sleep(wait)
     raise last
-    
-def get_logs_safe(from_block: int, to_block: int, topic: str) -> list:
-    """Fetch logs for single topic, splitting recursively if Alchemy complains."""
+
+
+def get_logs_safe(from_block: int, to_block: int, topic: str, address: str = None) -> list:
+    """Fetch logs for single topic, splitting recursively if node complains."""
     if from_block > to_block:
         return []
+    addr = address or str(POOL)
     try:
         return get_logs_with_retry({
             "fromBlock": from_block,
             "toBlock": to_block,
-            "address": POOL,
+            "address": addr,
             "topics": [topic],
         })
     except Exception as e:
@@ -197,8 +224,8 @@ def get_logs_safe(from_block: int, to_block: int, topic: str) -> list:
             print(f"  [error] single block {from_block} failed: {e}")
             return []
         mid = (from_block + to_block) // 2
-        left = get_logs_safe(from_block, mid, topic)
-        right = get_logs_safe(mid + 1, to_block, topic)
+        left = get_logs_safe(from_block, mid, topic, address)
+        right = get_logs_safe(mid + 1, to_block, topic, address)
         return left + right
 
 
@@ -206,10 +233,9 @@ def get_logs_safe(from_block: int, to_block: int, topic: str) -> list:
 # DECODE
 # =========================================================
 def _to_bytes(data) -> bytes:
-    """Normalize HexBytes / str / bytes to plain bytes."""
     if isinstance(data, (bytes, bytearray)):
         return bytes(data)
-    if hasattr(data, "hex"):          # HexBytes from web3
+    if hasattr(data, "hex"):
         return bytes(data)
     s = str(data)
     if s.startswith("0x") or s.startswith("0X"):
@@ -218,13 +244,17 @@ def _to_bytes(data) -> bytes:
 
 
 def topic_to_address(topic) -> str:
-    raw = _to_bytes(topic).hex()      # 32 bytes → 64 hex chars
+    raw = _to_bytes(topic).hex()
     return Web3.to_checksum_address("0x" + raw[-40:]).lower()
 
 
+def topic_to_uint256(topic) -> int:
+    return int(_to_bytes(topic).hex(), 16)
+
+
 def decode_int24_topic(topic) -> int:
-    raw = _to_bytes(topic).hex().zfill(64)  # ensure 64 chars
-    val = int(raw[-6:], 16)                 # last 3 bytes = int24
+    raw = _to_bytes(topic).hex().zfill(64)
+    val = int(raw[-6:], 16)
     if val >= 2 ** 23:
         val -= 2 ** 24
     return val
@@ -266,6 +296,22 @@ def save_sync(sync: dict):
         json.dump(sync, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+def load_token_ids() -> dict:
+    """
+    Returns dict: str(token_id) -> {minter, current_owner}
+    Persisted across runs so minter is never lost.
+    """
+    if not os.path.exists(TOKEN_IDS_FILE):
+        return {}
+    with open(TOKEN_IDS_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_token_ids(data: dict):
+    with open(TOKEN_IDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
 def load_event_ids() -> set:
     ids = set()
     if not os.path.exists(EVENTS_FILE):
@@ -287,7 +333,7 @@ def append_events(events: list):
 
 
 # =========================================================
-# COLLECT NEW EVENTS  (incremental)
+# COLLECT NEW EVENTS (incremental)
 # =========================================================
 def collect_events(sync: dict, end_block: int) -> dict:
     last = sync.get("last_scanned_block")
@@ -312,12 +358,21 @@ def collect_events(sync: dict, end_block: int) -> dict:
         mint_logs = get_logs_safe(chunk_start, chunk_end, MINT_TOPIC)
         burn_logs = get_logs_safe(chunk_start, chunk_end, BURN_TOPIC)
 
+        # NPM IncreaseLiquidity — tx_hash -> tokenId
+        npm_il_logs = get_logs_safe(chunk_start, chunk_end, INCREASE_LIQUIDITY_TOPIC, str(NPM))
+        npm_token_ids: dict = {}
+        for lg in npm_il_logs:
+            tx = lg["transactionHash"].hex().lower()
+            if len(lg["topics"]) >= 2:
+                npm_token_ids[tx] = topic_to_uint256(lg["topics"][1])
+
         new_events = []
 
+        # --- MINT ---
         for lg in mint_logs:
             tx = lg["transactionHash"].hex().lower()
             idx = int(lg["logIndex"])
-            eid = f"{tx}:{idx}"
+            eid = f"mint:{tx}:{idx}"
             if eid in existing_ids:
                 continue
             if len(lg["topics"]) < 4:
@@ -326,22 +381,30 @@ def collect_events(sync: dict, end_block: int) -> dict:
             tl = decode_int24_topic(lg["topics"][2])
             tu = decode_int24_topic(lg["topics"][3])
             _, liq, a0, a1 = decode_mint_data(lg["data"])
+            token_id = npm_token_ids.get(tx)
+
             new_events.append({
-                "event_id": eid, "event_type": "mint",
+                "event_id": eid,
+                "event_type": "mint",
                 "block_number": int(lg["blockNumber"]),
-                "tx_hash": tx, "log_index": idx,
+                "tx_hash": tx,
+                "log_index": idx,
                 "owner": owner,
-                "tick_lower": tl, "tick_upper": tu,
+                "tick_lower": tl,
+                "tick_upper": tu,
                 "liquidity_delta_raw": liq,
-                "amount0_raw": a0, "amount1_raw": a1,
+                "amount0_raw": a0,
+                "amount1_raw": a1,
+                "token_id": token_id,
             })
             existing_ids.add(eid)
             total_mint += 1
 
+        # --- BURN ---
         for lg in burn_logs:
             tx = lg["transactionHash"].hex().lower()
             idx = int(lg["logIndex"])
-            eid = f"{tx}:{idx}"
+            eid = f"burn:{tx}:{idx}"
             if eid in existing_ids:
                 continue
             if len(lg["topics"]) < 4:
@@ -350,14 +413,20 @@ def collect_events(sync: dict, end_block: int) -> dict:
             tl = decode_int24_topic(lg["topics"][2])
             tu = decode_int24_topic(lg["topics"][3])
             liq, a0, a1 = decode_burn_data(lg["data"])
+
             new_events.append({
-                "event_id": eid, "event_type": "burn",
+                "event_id": eid,
+                "event_type": "burn",
                 "block_number": int(lg["blockNumber"]),
-                "tx_hash": tx, "log_index": idx,
+                "tx_hash": tx,
+                "log_index": idx,
                 "owner": owner,
-                "tick_lower": tl, "tick_upper": tu,
+                "tick_lower": tl,
+                "tick_upper": tu,
                 "liquidity_delta_raw": -liq,
-                "amount0_raw": a0, "amount1_raw": a1,
+                "amount0_raw": a0,
+                "amount1_raw": a1,
+                "token_id": None,
             })
             existing_ids.add(eid)
             total_burn += 1
@@ -365,14 +434,15 @@ def collect_events(sync: dict, end_block: int) -> dict:
         append_events(new_events)
         total_written += len(new_events)
 
-        # Save progress after every chunk — if job is killed, we resume from here
         sync["last_scanned_block"] = chunk_end
         save_sync(sync)
 
         if i % 20 == 0 or i == total_chunks:
             pct = i / total_chunks * 100
-            print(f"  chunk {i}/{total_chunks} ({pct:.0f}%) block {chunk_end} | "
-                  f"mint={total_mint} burn={total_burn} written={total_written}")
+            print(
+                f"  chunk {i}/{total_chunks} ({pct:.0f}%) block {chunk_end} | "
+                f"mint={total_mint} burn={total_burn} written={total_written}"
+            )
 
         time.sleep(SLEEP_BETWEEN_CHUNKS)
 
@@ -382,6 +452,46 @@ def collect_events(sync: dict, end_block: int) -> dict:
         "burn": total_burn,
         "written": total_written,
     }
+
+
+# =========================================================
+# RESOLVE TOKEN IDS via ownerOf
+# =========================================================
+def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
+    """
+    For every active position with a token_id, call NPM.ownerOf(tokenId).
+    Preserves minter from previous runs (never overwritten).
+    Updates current_owner on every run.
+    """
+    active_token_ids = set()
+    for row in positions.values():
+        if row["liquidity_raw"] > 0 and row.get("token_id") is not None:
+            active_token_ids.add(row["token_id"])
+
+    if not active_token_ids:
+        return token_ids_state
+
+    print(f"  Resolving {len(active_token_ids)} tokenId(s) via ownerOf()...")
+
+    for token_id in sorted(active_token_ids):
+        key = str(token_id)
+        if key not in token_ids_state:
+            token_ids_state[key] = {"minter": None, "current_owner": None}
+
+        try:
+            owner = npm_c.functions.ownerOf(token_id).call().lower()
+        except Exception as e:
+            owner = None
+            print(f"  [warn] ownerOf({token_id}) failed ({e}) — position may be closed")
+
+        # Set minter only once (on first successful resolve)
+        if token_ids_state[key]["minter"] is None and owner is not None:
+            token_ids_state[key]["minter"] = owner
+
+        token_ids_state[key]["current_owner"] = owner
+        time.sleep(0.05)
+
+    return token_ids_state
 
 
 # =========================================================
@@ -409,18 +519,26 @@ def rebuild_positions() -> dict:
             if key not in positions:
                 positions[key] = {
                     "owner": owner,
-                    "tick_lower": tl, "tick_upper": tu,
+                    "tick_lower": tl,
+                    "tick_upper": tu,
                     "liquidity_raw": 0,
-                    "minted_amount0_raw": 0, "minted_amount1_raw": 0,
-                    "burned_amount0_raw": 0, "burned_amount1_raw": 0,
+                    "minted_amount0_raw": 0,
+                    "minted_amount1_raw": 0,
+                    "burned_amount0_raw": 0,
+                    "burned_amount1_raw": 0,
                     "first_seen_block": ev["block_number"],
                     "last_seen_block": ev["block_number"],
-                    "mint_count": 0, "burn_count": 0,
+                    "mint_count": 0,
+                    "burn_count": 0,
+                    "token_id": None,
                 }
 
             row = positions[key]
             row["first_seen_block"] = min(row["first_seen_block"], ev["block_number"])
             row["last_seen_block"] = max(row["last_seen_block"], ev["block_number"])
+
+            if ev.get("token_id") is not None:
+                row["token_id"] = ev["token_id"]
 
             liq_delta = int(ev["liquidity_delta_raw"])
             a0 = int(ev["amount0_raw"])
@@ -461,10 +579,14 @@ def load_pool_info() -> dict:
     sym1 = safe_call(t1.functions.symbol())
 
     return {
-        "token0": token0, "token1": token1,
-        "dec0": dec0, "dec1": dec1,
-        "sym0": sym0, "sym1": sym1,
-        "tick_spacing": tick_spacing, "fee": fee,
+        "token0": token0,
+        "token1": token1,
+        "dec0": dec0,
+        "dec1": dec1,
+        "sym0": sym0,
+        "sym1": sym1,
+        "tick_spacing": tick_spacing,
+        "fee": fee,
         "sqrt_price_x96": sqrt_price_x96,
         "current_tick": current_tick,
         "price_token1_per_token0": sqrt_price_x96_to_price(sqrt_price_x96, dec0, dec1),
@@ -475,7 +597,7 @@ def load_pool_info() -> dict:
 # =========================================================
 # BUILD CSV EXPORTS
 # =========================================================
-def build_exports(positions: dict, pool_info: dict):
+def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync: dict = None):
     sym0 = pool_info["sym0"].lower()
     sym1 = pool_info["sym1"].lower()
     dec0 = pool_info["dec0"]
@@ -485,9 +607,14 @@ def build_exports(positions: dict, pool_info: dict):
 
     positions_rows = []
     owner_aggr = defaultdict(lambda: {
-        "label": "external", "type": "external",
-        "liquidity_raw": 0, "positions": 0, "in_range": 0,
-        "cur0": Decimal(0), "cur1": Decimal(0),
+        "label": "external",
+        "type": "external",
+        "liquidity_raw": 0,
+        "positions": 0,
+        "in_range": 0,
+        "cur0": Decimal(0),
+        "cur1": Decimal(0),
+        "token_ids": [],
     })
     bucket_map = defaultdict(lambda: {
         "liq": 0, "our_liq": 0, "ext_liq": 0,
@@ -495,21 +622,40 @@ def build_exports(positions: dict, pool_info: dict):
         "owners": set(),
     })
 
-    our_liq = 0; ext_liq = 0
-    our_cur0 = Decimal(0); our_cur1 = Decimal(0)
-    ext_cur0 = Decimal(0); ext_cur1 = Decimal(0)
+    our_liq = 0
+    ext_liq = 0
+    our_cur0 = Decimal(0)
+    our_cur1 = Decimal(0)
+    ext_cur0 = Decimal(0)
+    ext_cur1 = Decimal(0)
 
     for row in positions.values():
         liq = int(row["liquidity_raw"])
         if liq <= 0:
             continue
 
-        owner = row["owner"].lower()
-        label = OUR_WALLETS.get(owner, "external")
-        otype = "ours" if owner in OUR_WALLETS else "external"
+        pool_owner = row["owner"].lower()
         tl = int(row["tick_lower"])
         tu = int(row["tick_upper"])
         in_range = tl <= current_tick < tu
+        token_id = row.get("token_id")
+
+        # Resolve real owner from token_ids_state
+        minter = ""
+        current_owner = ""
+        real_owner = pool_owner  # fallback (direct mint bypassing NPM)
+
+        if token_id is not None:
+            nft = token_ids_state.get(str(token_id), {})
+            minter = nft.get("minter") or ""
+            current_owner = nft.get("current_owner") or ""
+            if current_owner:
+                real_owner = current_owner
+            elif minter:
+                real_owner = minter
+
+        label = OUR_WALLETS.get(real_owner, "external")
+        otype = "ours" if real_owner in OUR_WALLETS else "external"
 
         cur0_dec, cur1_dec = current_amounts_from_liquidity(liq, tl, tu, sqrt_price_x96)
         cur0 = human(cur0_dec, dec0)
@@ -519,14 +665,21 @@ def build_exports(positions: dict, pool_info: dict):
         net1 = human(row["minted_amount1_raw"] - row["burned_amount1_raw"], dec1)
 
         if otype == "ours":
-            our_liq += liq; our_cur0 += cur0; our_cur1 += cur1
+            our_liq += liq
+            our_cur0 += cur0
+            our_cur1 += cur1
         else:
-            ext_liq += liq; ext_cur0 += cur0; ext_cur1 += cur1
+            ext_liq += liq
+            ext_cur0 += cur0
+            ext_cur1 += cur1
 
         positions_rows.append({
-            "owner": owner,
+            "token_id": token_id if token_id is not None else "",
+            "minter": minter,
+            "current_owner": current_owner,
             "label": label,
             "type": otype,
+            "pool_owner": pool_owner,
             "tick_lower": tl,
             "tick_upper": tu,
             "width_ticks": tu - tl,
@@ -546,34 +699,45 @@ def build_exports(positions: dict, pool_info: dict):
             "last_block": row["last_seen_block"],
         })
 
-        ag = owner_aggr[owner]
-        ag["label"] = label; ag["type"] = otype
-        ag["liquidity_raw"] += liq; ag["positions"] += 1
+        ag = owner_aggr[real_owner]
+        ag["label"] = label
+        ag["type"] = otype
+        ag["liquidity_raw"] += liq
+        ag["positions"] += 1
         ag["in_range"] += 1 if in_range else 0
-        ag["cur0"] += cur0; ag["cur1"] += cur1
+        ag["cur0"] += cur0
+        ag["cur1"] += cur1
+        if token_id is not None:
+            ag["token_ids"].append(str(token_id))
 
-        # bucket distribution
         b_start = tick_to_bucket_floor(tl, BUCKET_SIZE)
         b_end = tick_to_bucket_floor(tu - 1, BUCKET_SIZE)
         b = b_start
         while b <= b_end:
             bm = bucket_map[b]
-            bm["liq"] += liq; bm["pos"] += 1; bm["owners"].add(owner)
+            bm["liq"] += liq
+            bm["pos"] += 1
+            bm["owners"].add(real_owner)
             if otype == "ours":
-                bm["our_liq"] += liq; bm["our_pos"] += 1
+                bm["our_liq"] += liq
+                bm["our_pos"] += 1
             else:
-                bm["ext_liq"] += liq; bm["ext_pos"] += 1
+                bm["ext_liq"] += liq
+                bm["ext_pos"] += 1
             b += BUCKET_SIZE
 
-    positions_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"], r["owner"]))
+    positions_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"], r["current_owner"]))
 
     top_lp_rows = []
     for owner, ag in owner_aggr.items():
         top_lp_rows.append({
-            "owner": owner, "label": ag["label"], "type": ag["type"],
+            "owner": owner,
+            "label": ag["label"],
+            "type": ag["type"],
             "liquidity": ag["liquidity_raw"],
             "positions": ag["positions"],
             "in_range_positions": ag["in_range"],
+            "token_ids": ",".join(ag["token_ids"]),
             f"cur_{sym0}": fmt(ag["cur0"]),
             f"cur_{sym1}": fmt(ag["cur1"]),
         })
@@ -583,7 +747,8 @@ def build_exports(positions: dict, pool_info: dict):
     for bk in sorted(bucket_map):
         bm = bucket_map[bk]
         bucket_rows.append({
-            "tick_lower": bk, "tick_upper": bk + BUCKET_SIZE,
+            "tick_lower": bk,
+            "tick_upper": bk + BUCKET_SIZE,
             "liquidity": bm["liq"],
             "our_liquidity": bm["our_liq"],
             "ext_liquidity": bm["ext_liq"],
@@ -599,8 +764,10 @@ def build_exports(positions: dict, pool_info: dict):
 
     summary_rows = [
         {"metric": "pool", "value": str(POOL)},
+        {"metric": "npm", "value": str(NPM)},
         {"metric": "chain_id", "value": CHAIN_ID},
         {"metric": "from_block", "value": FROM_BLOCK},
+        {"metric": "last_scanned_block", "value": (sync or {}).get("last_scanned_block", "")},
         {"metric": f"token0_{sym0}", "value": pool_info["token0"]},
         {"metric": f"token1_{sym1}", "value": pool_info["token1"]},
         {"metric": "dec0", "value": dec0},
@@ -612,7 +779,7 @@ def build_exports(positions: dict, pool_info: dict):
         {"metric": "pool_liquidity_raw", "value": pool_info["pool_liquidity_raw"]},
         {"metric": "open_positions", "value": open_pos},
         {"metric": "in_range_positions", "value": in_range_pos},
-        {"metric": "unique_owners", "value": len(owner_aggr)},
+        {"metric": "unique_real_owners", "value": len(owner_aggr)},
         {"metric": "our_positions", "value": sum(1 for r in positions_rows if r["type"] == "ours")},
         {"metric": "our_liquidity", "value": our_liq},
         {"metric": "ext_liquidity", "value": ext_liq},
@@ -639,6 +806,115 @@ def write_csv(path: str, rows: list, fieldnames: list = None):
 
 
 # =========================================================
+# GOOGLE SHEETS EXPORT
+# =========================================================
+def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
+    """
+    Writes data to Google Sheets (separate spreadsheet from Uniswap indexer):
+      Sheet names: aero_positions, aero_buckets, aero_summary, aero_snapshots
+      - aero_positions  : overwritten each run (current snapshot)
+      - aero_buckets    : overwritten each run
+      - aero_summary    : overwritten each run
+      - aero_snapshots  : appended only (history: timestamp + key metrics)
+    Skipped silently if AERO_SPREADSHEET_ID or GOOGLE_CREDENTIALS are not set.
+    """
+    if not SPREADSHEET_ID or not GOOGLE_CREDENTIALS_JSON:
+        print("  [sheets] AERO_SPREADSHEET_ID or GOOGLE_CREDENTIALS not set — skipping")
+        return
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        print("  [sheets] gspread not installed — skipping (add gspread google-auth to requirements.txt)")
+        return
+
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        print(f"  [sheets] auth/open failed: {e}")
+        return
+
+    def get_or_create(title: str):
+        try:
+            return sh.worksheet(title)
+        except gspread.WorksheetNotFound:
+            return sh.add_worksheet(title=title, rows=2000, cols=30)
+
+    def overwrite(title: str, rows: list):
+        ws = get_or_create(title)
+        ws.clear()
+        if not rows:
+            print(f"  [sheets] '{title}' cleared (0 rows)")
+            return
+        headers = list(rows[0].keys())
+        data = [headers] + [[str(r.get(h, "")) for h in headers] for r in rows]
+        ws.update(data, value_input_option="USER_ENTERED")
+        print(f"  [sheets] '{title}' updated ({len(rows)} rows)")
+
+    # --- overwrite current snapshot sheets ---
+    overwrite("aero_positions", pos_rows)
+    overwrite("aero_buckets", bucket_rows)
+    overwrite("aero_summary", summary_rows)
+
+    # --- append to snapshots history ---
+    try:
+        ws_snap = get_or_create("aero_snapshots")
+        existing = ws_snap.get_all_values()
+
+        snap_headers = [
+            "timestamp_utc", "last_block",
+            "current_tick", "open_positions", "in_range_positions",
+            "our_positions", "our_liquidity",
+            "our_cur_usdc", "our_cur_lmts",
+            "ext_liquidity", "ext_cur_usdc", "ext_cur_lmts",
+            "unique_real_owners",
+        ]
+
+        if not existing or existing[0] != snap_headers:
+            ws_snap.clear()
+            ws_snap.append_row(snap_headers, value_input_option="USER_ENTERED")
+
+        sm = {r["metric"]: str(r["value"]) for r in summary_rows}
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        def find_sm(prefix):
+            for k, v in sm.items():
+                if k.startswith(prefix):
+                    return v
+            return ""
+
+        snap_row = [
+            now_utc,
+            sm.get("last_scanned_block", ""),
+            sm.get("current_tick", ""),
+            sm.get("open_positions", ""),
+            sm.get("in_range_positions", ""),
+            sm.get("our_positions", ""),
+            sm.get("our_liquidity", ""),
+            find_sm("our_cur_usdc") or find_sm("our_cur_u"),
+            find_sm("our_cur_lmts") or find_sm("our_cur_l"),
+            sm.get("ext_liquidity", ""),
+            find_sm("ext_cur_usdc") or find_sm("ext_cur_u"),
+            find_sm("ext_cur_lmts") or find_sm("ext_cur_l"),
+            sm.get("unique_real_owners", ""),
+        ]
+
+        ws_snap.append_row(snap_row, value_input_option="USER_ENTERED")
+        print(f"  [sheets] 'aero_snapshots' row appended ({now_utc})")
+
+    except Exception as e:
+        print(f"  [sheets] snapshots append failed: {e}")
+
+
+# =========================================================
 # MAIN
 # =========================================================
 def main():
@@ -653,9 +929,10 @@ def main():
     pool_info = load_pool_info()
 
     print("=" * 60)
-    print("POOL INFO")
+    print("POOL INFO (Aerodrome)")
     print("=" * 60)
     print(f"Pool:          {POOL}")
+    print(f"NPM:           {NPM}")
     print(f"Tokens:        {pool_info['sym0']} / {pool_info['sym1']}")
     print(f"Fee:           {pool_info['fee']}  tick_spacing: {pool_info['tick_spacing']}")
     print(f"Current tick:  {pool_info['current_tick']}")
@@ -689,14 +966,31 @@ def main():
 
     print()
     print("=" * 60)
+    print("RESOLVING TOKEN OWNERS")
+    print("=" * 60)
+    token_ids_state = load_token_ids()
+    token_ids_state = resolve_token_ids(positions, token_ids_state)
+    save_token_ids(token_ids_state)
+    print(f"  total tokenIds tracked: {len(token_ids_state)}")
+
+    print()
+    print("=" * 60)
     print("WRITING EXPORTS")
     print("=" * 60)
-    pos_rows, lp_rows, bucket_rows, summary_rows = build_exports(positions, pool_info)
+    pos_rows, lp_rows, bucket_rows, summary_rows = build_exports(
+        positions, token_ids_state, pool_info, sync
+    )
 
-    write_csv(f"{OUT_DIR}/open_positions.csv", pos_rows)
-    write_csv(f"{OUT_DIR}/top_lp.csv", lp_rows)
-    write_csv(f"{OUT_DIR}/buckets.csv", bucket_rows)
-    write_csv(f"{OUT_DIR}/summary.csv", summary_rows, fieldnames=["metric", "value"])
+    write_csv(os.path.join(OUT_DIR, "open_positions.csv"), pos_rows)
+    write_csv(os.path.join(OUT_DIR, "top_lp.csv"), lp_rows)
+    write_csv(os.path.join(OUT_DIR, "buckets.csv"), bucket_rows)
+    write_csv(os.path.join(OUT_DIR, "summary.csv"), summary_rows, fieldnames=["metric", "value"])
+
+    print()
+    print("=" * 60)
+    print("GOOGLE SHEETS EXPORT")
+    print("=" * 60)
+    export_to_sheets(pos_rows, bucket_rows, summary_rows)
 
     print()
     print("=== SUMMARY ===")
