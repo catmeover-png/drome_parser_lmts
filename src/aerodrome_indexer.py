@@ -11,6 +11,7 @@ Aerodrome LP Indexer (Base)
 - Minter tracked in state/<pool>/token_ids.json (preserved across runs)
 - Exports CSV files into out/<pool>/
 - Google Sheets export: aero_positions, aero_buckets, aero_summary, aero_snapshots
+- Price buckets are in USD per 1 LMTS (same as Uniswap indexer)
 
 NOTE: Aerodrome Slipstream uses its own Position Manager (NOT Uniswap NPM).
       Aerodrome NPM on Base: 0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F
@@ -42,7 +43,6 @@ FROM_BLOCK = 43139450
 
 # Aerodrome Slipstream NonfungiblePositionManager on Base
 # (different from Uniswap NPM 0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1)
-# Confirmed from tx logs: IncreaseLiquidity emitted by this contract
 NPM = Web3.to_checksum_address("0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F")
 
 OUR_WALLETS = {
@@ -68,7 +68,9 @@ RETRIES = 5
 RETRY_SLEEP = 2.0
 TIMEOUT = 30
 CONFIRMATIONS_BUFFER = 5
-BUCKET_SIZE = 50
+
+# price bucket step in USD per 1 LMTS — same as Uniswap indexer
+PRICE_BUCKET_SIZE = Decimal("0.01")
 
 EXPECTED_TOKEN0 = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower()  # USDC
 EXPECTED_TOKEN1 = "0x9EadbE35F3Ee3bF3e28180070C429298a1b02F93".lower()  # LMTS
@@ -124,7 +126,6 @@ MINT_TOPIC = "0x" + w3.keccak(text="Mint(address,address,int24,int24,uint128,uin
 BURN_TOPIC = "0x" + w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
 
 # Aerodrome Slipstream NPM IncreaseLiquidity — same signature as Uniswap, different contract
-# topic0: 0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f (confirmed from tx)
 INCREASE_LIQUIDITY_TOPIC = "0x" + w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
 
 # =========================================================
@@ -171,14 +172,6 @@ def fmt(x: Decimal, places: int = 6) -> str:
     return str(x.quantize(q))
 
 
-def tick_to_bucket_floor(tick: int, size: int) -> int:
-    if tick >= 0:
-        return (tick // size) * size
-    return -(((-tick + size - 1) // size) * size)
-
-
-# --- Price conversion helpers (same as Uniswap indexer) ---
-
 def tick_to_price_token1_per_token0(tick: int, dec0: int, dec1: int) -> Decimal:
     return (Decimal("1.0001") ** Decimal(tick)) * (Decimal(10) ** Decimal(dec0 - dec1))
 
@@ -194,6 +187,10 @@ def position_price_range_usdc_per_lmts(tick_lower: int, tick_upper: int, dec0: i
     p1 = tick_to_price_usdc_per_lmts(tick_lower, dec0, dec1)
     p2 = tick_to_price_usdc_per_lmts(tick_upper, dec0, dec1)
     return min(p1, p2), max(p1, p2)
+
+
+def price_bucket_floor(price: Decimal, step: Decimal) -> Decimal:
+    return (price // step) * step
 
 
 # =========================================================
@@ -235,7 +232,6 @@ def get_logs_with_retry(params: dict) -> list:
 
 
 def get_logs_safe(from_block: int, to_block: int, topic: str, address: str = None) -> list:
-    """Fetch logs for single topic, splitting recursively if node complains."""
     if from_block > to_block:
         return []
     addr = address or str(POOL)
@@ -381,7 +377,6 @@ def collect_events(sync: dict, end_block: int) -> dict:
         mint_logs = get_logs_safe(chunk_start, chunk_end, MINT_TOPIC)
         burn_logs = get_logs_safe(chunk_start, chunk_end, BURN_TOPIC)
 
-        # Aerodrome NPM IncreaseLiquidity — tx_hash -> tokenId
         npm_il_logs = get_logs_safe(chunk_start, chunk_end, INCREASE_LIQUIDITY_TOPIC, str(NPM))
         npm_token_ids: dict = {}
         for lg in npm_il_logs:
@@ -391,7 +386,6 @@ def collect_events(sync: dict, end_block: int) -> dict:
 
         new_events = []
 
-        # --- MINT ---
         for lg in mint_logs:
             tx = lg["transactionHash"].hex().lower()
             idx = int(lg["logIndex"])
@@ -423,7 +417,6 @@ def collect_events(sync: dict, end_block: int) -> dict:
             existing_ids.add(eid)
             total_mint += 1
 
-        # --- BURN ---
         for lg in burn_logs:
             tx = lg["transactionHash"].hex().lower()
             idx = int(lg["logIndex"])
@@ -623,7 +616,6 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
     current_tick = pool_info["current_tick"]
     sqrt_price_x96 = pool_info["sqrt_price_x96"]
 
-    # Current price in USD per LMTS (same as Uniswap indexer)
     current_price_usd_per_lmts = Decimal(1) / pool_info["price_token1_per_token0"]
 
     positions_rows = []
@@ -637,6 +629,8 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         "cur1": Decimal(0),
         "token_ids": [],
     })
+
+    # bucket_map keyed by str(price_floor) — same as Uniswap indexer
     bucket_map = defaultdict(lambda: {
         "liq": 0, "our_liq": 0, "ext_liq": 0,
         "pos": 0, "our_pos": 0, "ext_pos": 0,
@@ -661,10 +655,9 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         in_range = tl <= current_tick < tu
         token_id = row.get("token_id")
 
-        # Resolve real owner via token_ids_state (ownerOf on Aerodrome NPM)
         minter = ""
         current_owner = ""
-        real_owner = pool_owner  # fallback
+        real_owner = pool_owner
 
         if token_id is not None:
             nft = token_ids_state.get(str(token_id), {})
@@ -678,7 +671,6 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         label = OUR_WALLETS.get(real_owner, "external")
         otype = "ours" if real_owner in OUR_WALLETS else "external"
 
-        # Price range in USD per LMTS (same logic as Uniswap indexer)
         price_lower, price_upper = position_price_range_usdc_per_lmts(tl, tu, dec0, dec1)
 
         cur0_dec, cur1_dec = current_amounts_from_liquidity(liq, tl, tu, sqrt_price_x96)
@@ -707,8 +699,8 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
             "tick_lower": tl,
             "tick_upper": tu,
             "width_ticks": tu - tl,
-            "price_lower_usd_per_lmts": fmt(price_lower, 6),   # added
-            "price_upper_usd_per_lmts": fmt(price_upper, 6),   # added
+            "price_lower_usd_per_lmts": fmt(price_lower, 6),
+            "price_upper_usd_per_lmts": fmt(price_upper, 6),
             "liquidity": liq,
             "in_range": in_range,
             f"cur_{sym0}": fmt(cur0),
@@ -736,12 +728,12 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         if token_id is not None:
             ag["token_ids"].append(str(token_id))
 
-        # Buckets stay in ticks (Aerodrome-native)
-        b_start = tick_to_bucket_floor(tl, BUCKET_SIZE)
-        b_end = tick_to_bucket_floor(tu - 1, BUCKET_SIZE)
+        # Price-based buckets — identical logic to Uniswap indexer
+        b_start = price_bucket_floor(price_lower, PRICE_BUCKET_SIZE)
+        b_end = price_bucket_floor(price_upper, PRICE_BUCKET_SIZE)
         b = b_start
         while b <= b_end:
-            bm = bucket_map[b]
+            bm = bucket_map[str(b)]
             bm["liq"] += liq
             bm["pos"] += 1
             bm["owners"].add(real_owner)
@@ -751,7 +743,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
             else:
                 bm["ext_liq"] += liq
                 bm["ext_pos"] += 1
-            b += BUCKET_SIZE
+            b += PRICE_BUCKET_SIZE
 
     positions_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"], r["current_owner"]))
 
@@ -770,12 +762,15 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         })
     top_lp_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"]))
 
+    # bucket_rows — identical structure to Uniswap indexer
     bucket_rows = []
-    for bk in sorted(bucket_map):
-        bm = bucket_map[bk]
+    for bk_str in sorted(bucket_map.keys(), key=lambda x: Decimal(x)):
+        bm = bucket_map[bk_str]
+        bk = Decimal(bk_str)
+        upper = bk + PRICE_BUCKET_SIZE
         bucket_rows.append({
-            "tick_lower": bk,
-            "tick_upper": bk + BUCKET_SIZE,
+            "price_lower_usd_per_lmts": fmt(bk, 6),
+            "price_upper_usd_per_lmts": fmt(upper, 6),
             "liquidity": bm["liq"],
             "our_liquidity": bm["our_liq"],
             "ext_liquidity": bm["ext_liq"],
@@ -783,7 +778,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
             "our_positions": bm["our_pos"],
             "ext_positions": bm["ext_pos"],
             "unique_owners": len(bm["owners"]),
-            "is_current_tick": bk <= current_tick < bk + BUCKET_SIZE,
+            "contains_current_price": bk <= current_price_usd_per_lmts < upper,
         })
 
     open_pos = len(positions_rows)
@@ -803,7 +798,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         {"metric": "tick_spacing", "value": pool_info["tick_spacing"]},
         {"metric": "current_tick", "value": current_tick},
         {"metric": f"price_{sym1}_per_{sym0}", "value": fmt(pool_info["price_token1_per_token0"], 8)},
-        {"metric": "price_usd_per_lmts", "value": fmt(current_price_usd_per_lmts, 8)},  # added
+        {"metric": "price_usd_per_lmts", "value": fmt(current_price_usd_per_lmts, 8)},
         {"metric": "pool_liquidity_raw", "value": pool_info["pool_liquidity_raw"]},
         {"metric": "open_positions", "value": open_pos},
         {"metric": "in_range_positions", "value": in_range_pos},
@@ -882,14 +877,13 @@ def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
     overwrite("aero_buckets", bucket_rows)
     overwrite("aero_summary", summary_rows)
 
-    # --- append to snapshots history ---
     try:
         ws_snap = get_or_create("aero_snapshots")
         existing = ws_snap.get_all_values()
 
         snap_headers = [
             "timestamp_utc", "last_block",
-            "price_usd_per_lmts", "current_tick",   # added price_usd_per_lmts
+            "price_usd_per_lmts", "current_tick",
             "open_positions", "in_range_positions",
             "our_positions", "our_liquidity",
             "our_cur_usdc", "our_cur_lmts",
@@ -913,7 +907,7 @@ def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
         snap_row = [
             now_utc,
             sm.get("last_scanned_block", ""),
-            sm.get("price_usd_per_lmts", ""),       # added
+            sm.get("price_usd_per_lmts", ""),
             sm.get("current_tick", ""),
             sm.get("open_positions", ""),
             sm.get("in_range_positions", ""),
