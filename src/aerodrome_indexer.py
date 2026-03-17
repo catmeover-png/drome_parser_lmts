@@ -6,11 +6,16 @@ Aerodrome LP Indexer (Base)
 - First run: full backfill from FROM_BLOCK
 - Subsequent runs: only new blocks since last sync
 - State persisted in state/<pool>/sync.json + events.ndjson
-- TokenId tracked via NPM IncreaseLiquidity events
-- Current owner resolved via NPM.ownerOf(tokenId) eth_call at end of run
+- TokenId tracked via Aerodrome Slipstream NPM IncreaseLiquidity events
+- Current owner resolved via Aerodrome NPM.ownerOf(tokenId) eth_call at end of run
 - Minter tracked in state/<pool>/token_ids.json (preserved across runs)
 - Exports CSV files into out/<pool>/
 - Google Sheets export: aero_positions, aero_buckets, aero_summary, aero_snapshots
+
+NOTE: Aerodrome Slipstream uses its own Position Manager (NOT Uniswap NPM).
+      Aerodrome NPM on Base: 0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F
+      Pool Mint event owner = Aerodrome NPM address (not the real wallet).
+      Real wallet = ownerOf(tokenId) on the Aerodrome NPM.
 """
 
 import os
@@ -35,13 +40,15 @@ CHAIN_ID = 8453
 POOL = Web3.to_checksum_address("0xbe4C36B9542610dF83Ca690C8b5BC53BbbC5d542")
 FROM_BLOCK = 43139450
 
-# Uniswap V3 NonfungiblePositionManager on Base (same contract used by Aerodrome CL)
-NPM = Web3.to_checksum_address("0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1")
+# Aerodrome Slipstream NonfungiblePositionManager on Base
+# (different from Uniswap NPM 0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1)
+# Confirmed from tx logs: IncreaseLiquidity emitted by this contract
+NPM = Web3.to_checksum_address("0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F")
 
 OUR_WALLETS = {
     "0x5f0aea872b7d6dbcc181338f80048b130e443e3b": "our_pool_wallet",
     "0x44a3f0354f4c10eb9cd93e522b5e3210d126f054": "team_mm2",
-    "0x8EBE6ad4F5Bd2F471E0eB828c5918996Dd2CD756": "buyb_cnbase",
+    "0x8ebe6ad4f5bd2f471e0eb828c5918996dd2cd756": "buyb_cnbase",
 }
 
 # Google Sheets — separate spreadsheet from Uniswap indexer
@@ -55,7 +62,6 @@ EVENTS_FILE = os.path.join(STATE_DIR, "events.ndjson")
 TOKEN_IDS_FILE = os.path.join(STATE_DIR, "token_ids.json")
 OUT_DIR = os.path.join("out", POOL_ID)
 
-# Alchemy allows max 2000 blocks per eth_getLogs
 CHUNK_SIZE = 2000
 SLEEP_BETWEEN_CHUNKS = 0.15
 RETRIES = 5
@@ -117,8 +123,9 @@ npm_c = w3.eth.contract(address=NPM, abi=NPM_ABI)
 MINT_TOPIC = "0x" + w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
 BURN_TOPIC = "0x" + w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
 
-# NPM: IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)
-INCREASE_LIQUIDITY_TOPIC = w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+# Aerodrome Slipstream NPM IncreaseLiquidity — same signature as Uniswap, different contract
+# topic0: 0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f (confirmed from tx)
+INCREASE_LIQUIDITY_TOPIC = "0x" + w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
 
 # =========================================================
 # MATH
@@ -298,10 +305,6 @@ def save_sync(sync: dict):
 
 
 def load_token_ids() -> dict:
-    """
-    Returns dict: str(token_id) -> {minter, current_owner}
-    Persisted across runs so minter is never lost.
-    """
     if not os.path.exists(TOKEN_IDS_FILE):
         return {}
     with open(TOKEN_IDS_FILE, encoding="utf-8") as f:
@@ -359,7 +362,7 @@ def collect_events(sync: dict, end_block: int) -> dict:
         mint_logs = get_logs_safe(chunk_start, chunk_end, MINT_TOPIC)
         burn_logs = get_logs_safe(chunk_start, chunk_end, BURN_TOPIC)
 
-        # NPM IncreaseLiquidity — tx_hash -> tokenId
+        # Aerodrome NPM IncreaseLiquidity — tx_hash -> tokenId
         npm_il_logs = get_logs_safe(chunk_start, chunk_end, INCREASE_LIQUIDITY_TOPIC, str(NPM))
         npm_token_ids: dict = {}
         for lg in npm_il_logs:
@@ -390,13 +393,13 @@ def collect_events(sync: dict, end_block: int) -> dict:
                 "block_number": int(lg["blockNumber"]),
                 "tx_hash": tx,
                 "log_index": idx,
-                "owner": owner,
+                "owner": owner,       # = Aerodrome NPM for most positions
                 "tick_lower": tl,
                 "tick_upper": tu,
                 "liquidity_delta_raw": liq,
                 "amount0_raw": a0,
                 "amount1_raw": a1,
-                "token_id": token_id,
+                "token_id": token_id, # real owner resolved later via ownerOf
             })
             existing_ids.add(eid)
             total_mint += 1
@@ -456,11 +459,11 @@ def collect_events(sync: dict, end_block: int) -> dict:
 
 
 # =========================================================
-# RESOLVE TOKEN IDS via ownerOf
+# RESOLVE TOKEN IDS via ownerOf (Aerodrome NPM)
 # =========================================================
 def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
     """
-    For every active position with a token_id, call NPM.ownerOf(tokenId).
+    For every active position with a token_id, call Aerodrome NPM.ownerOf(tokenId).
     Preserves minter from previous runs (never overwritten).
     Updates current_owner on every run.
     """
@@ -470,9 +473,10 @@ def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
             active_token_ids.add(row["token_id"])
 
     if not active_token_ids:
+        print("  No active tokenIds to resolve.")
         return token_ids_state
 
-    print(f"  Resolving {len(active_token_ids)} tokenId(s) via ownerOf()...")
+    print(f"  Resolving {len(active_token_ids)} tokenId(s) via Aerodrome NPM ownerOf()...")
 
     for token_id in sorted(active_token_ids):
         key = str(token_id)
@@ -485,7 +489,6 @@ def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
             owner = None
             print(f"  [warn] ownerOf({token_id}) failed ({e}) — position may be closed")
 
-        # Set minter only once (on first successful resolve)
         if token_ids_state[key]["minter"] is None and owner is not None:
             token_ids_state[key]["minter"] = owner
 
@@ -635,16 +638,16 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         if liq <= 0:
             continue
 
-        pool_owner = row["owner"].lower()
+        pool_owner = row["owner"].lower()  # = Aerodrome NPM for most positions
         tl = int(row["tick_lower"])
         tu = int(row["tick_upper"])
         in_range = tl <= current_tick < tu
         token_id = row.get("token_id")
 
-        # Resolve real owner from token_ids_state
+        # Resolve real owner via token_ids_state (ownerOf on Aerodrome NPM)
         minter = ""
         current_owner = ""
-        real_owner = pool_owner  # fallback (direct mint bypassing NPM)
+        real_owner = pool_owner  # fallback
 
         if token_id is not None:
             nft = token_ids_state.get(str(token_id), {})
@@ -810,15 +813,6 @@ def write_csv(path: str, rows: list, fieldnames: list = None):
 # GOOGLE SHEETS EXPORT
 # =========================================================
 def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
-    """
-    Writes data to Google Sheets (separate spreadsheet from Uniswap indexer):
-      Sheet names: aero_positions, aero_buckets, aero_summary, aero_snapshots
-      - aero_positions  : overwritten each run (current snapshot)
-      - aero_buckets    : overwritten each run
-      - aero_summary    : overwritten each run
-      - aero_snapshots  : appended only (history: timestamp + key metrics)
-    Skipped silently if AERO_SPREADSHEET_ID or GOOGLE_CREDENTIALS are not set.
-    """
     if not SPREADSHEET_ID or not GOOGLE_CREDENTIALS_JSON:
         print("  [sheets] AERO_SPREADSHEET_ID or GOOGLE_CREDENTIALS not set — skipping")
         return
@@ -827,7 +821,7 @@ def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
         import gspread
         from google.oauth2.service_account import Credentials
     except ImportError:
-        print("  [sheets] gspread not installed — skipping (add gspread google-auth to requirements.txt)")
+        print("  [sheets] gspread not installed — skipping")
         return
 
     try:
@@ -860,12 +854,10 @@ def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
         ws.update(data, value_input_option="USER_ENTERED")
         print(f"  [sheets] '{title}' updated ({len(rows)} rows)")
 
-    # --- overwrite current snapshot sheets ---
     overwrite("aero_positions", pos_rows)
     overwrite("aero_buckets", bucket_rows)
     overwrite("aero_summary", summary_rows)
 
-    # --- append to snapshots history ---
     try:
         ws_snap = get_or_create("aero_snapshots")
         existing = ws_snap.get_all_values()
@@ -930,10 +922,10 @@ def main():
     pool_info = load_pool_info()
 
     print("=" * 60)
-    print("POOL INFO (Aerodrome)")
+    print("POOL INFO (Aerodrome Slipstream)")
     print("=" * 60)
     print(f"Pool:          {POOL}")
-    print(f"NPM:           {NPM}")
+    print(f"NPM (Aero):    {NPM}")
     print(f"Tokens:        {pool_info['sym0']} / {pool_info['sym1']}")
     print(f"Fee:           {pool_info['fee']}  tick_spacing: {pool_info['tick_spacing']}")
     print(f"Current tick:  {pool_info['current_tick']}")
