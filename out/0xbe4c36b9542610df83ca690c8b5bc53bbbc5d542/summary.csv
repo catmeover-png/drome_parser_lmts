@@ -1,9 +1,9 @@
 metric,value
 pool,0xbe4C36B9542610dF83Ca690C8b5BC53BbbC5d542
-npm,0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1
+npm,0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F
 chain_id,8453
 from_block,43139450
-last_scanned_block,43489360
+last_scanned_block,43490116
 token0_usdc,0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
 token1_lmts,0x9EadbE35F3Ee3bF3e28180070C429298a1b02F93
 dec0,6
@@ -11,7 +11,7 @@ dec1,18
 fee,500
 tick_spacing,10
 current_tick,296007
-price_lmts_per_usdc,7.15834553
+price_lmts_per_usdc,7.15833686
 pool_liquidity_raw,879441087741846
 open_positions,1
 in_range_positions,1
@@ -21,5 +21,5 @@ our_liquidity,0
 ext_liquidity,879441087741846
 our_cur_usdc,0.000000
 our_cur_lmts,0.000000
-ext_cur_usdc,96.046076
-ext_cur_lmts,1108.976151
+ext_cur_usdc,96.046275
+ext_cur_lmts,1108.974726
