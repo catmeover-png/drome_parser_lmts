@@ -1,10 +1,16 @@
-name: run-aerodrome-lp-indexer
+name: aerodrome-lp-indexer
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "36 */2 * * *"
 
 permissions:
   contents: write
+
+concurrency:
+  group: aerodrome-lp-indexer-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run-indexer:
@@ -17,10 +23,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/sync.json
+            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/events.ndjson
+            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/token_ids.json
+          key: aero-indexer-state-${{ github.ref_name }}
+          restore-keys: aero-indexer-state-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
 
       - name: Install dependencies
         run: |
@@ -30,25 +52,35 @@ jobs:
       - name: Run indexer
         env:
           BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
-        run: |
-          python src/indexer.py
+          AERO_SPREADSHEET_ID: ${{ secrets.AERO_SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python src/aerodrome_indexer.py
 
       - name: Upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aerodrome-lp-exports
-          path: out/*.csv
+          name: aerodrome-lp-exports-${{ github.run_number }}
+          path: out/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/*.csv
+          retention-days: 30
 
-      - name: Commit updated state and exports
+      - name: Commit state and exports
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add state/state.json out/*.csv || true
+          git add \
+            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/sync.json \
+            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/token_ids.json \
+            "out/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/open_positions.csv" \
+            "out/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/top_lp.csv" \
+            "out/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/buckets.csv" \
+            "out/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/summary.csv" \
+            || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Update LP indexer state and exports"
+            BLOCK=$(python -c "import json,os; f='state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/sync.json'; print(json.load(open(f)).get('last_scanned_block','unknown')) if os.path.exists(f) else print('unknown')")
+            git commit -m "chore: Aerodrome LP snapshot block ${BLOCK}"
             git push
           fi
