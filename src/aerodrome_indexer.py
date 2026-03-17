@@ -177,6 +177,25 @@ def tick_to_bucket_floor(tick: int, size: int) -> int:
     return -(((-tick + size - 1) // size) * size)
 
 
+# --- Price conversion helpers (same as Uniswap indexer) ---
+
+def tick_to_price_token1_per_token0(tick: int, dec0: int, dec1: int) -> Decimal:
+    return (Decimal("1.0001") ** Decimal(tick)) * (Decimal(10) ** Decimal(dec0 - dec1))
+
+
+def tick_to_price_usdc_per_lmts(tick: int, dec0: int, dec1: int) -> Decimal:
+    lmts_per_usdc = tick_to_price_token1_per_token0(tick, dec0, dec1)
+    if lmts_per_usdc == 0:
+        return Decimal(0)
+    return Decimal(1) / lmts_per_usdc
+
+
+def position_price_range_usdc_per_lmts(tick_lower: int, tick_upper: int, dec0: int, dec1: int) -> tuple:
+    p1 = tick_to_price_usdc_per_lmts(tick_lower, dec0, dec1)
+    p2 = tick_to_price_usdc_per_lmts(tick_upper, dec0, dec1)
+    return min(p1, p2), max(p1, p2)
+
+
 # =========================================================
 # RPC HELPERS
 # =========================================================
@@ -393,13 +412,13 @@ def collect_events(sync: dict, end_block: int) -> dict:
                 "block_number": int(lg["blockNumber"]),
                 "tx_hash": tx,
                 "log_index": idx,
-                "owner": owner,       # = Aerodrome NPM for most positions
+                "owner": owner,
                 "tick_lower": tl,
                 "tick_upper": tu,
                 "liquidity_delta_raw": liq,
                 "amount0_raw": a0,
                 "amount1_raw": a1,
-                "token_id": token_id, # real owner resolved later via ownerOf
+                "token_id": token_id,
             })
             existing_ids.add(eid)
             total_mint += 1
@@ -462,11 +481,6 @@ def collect_events(sync: dict, end_block: int) -> dict:
 # RESOLVE TOKEN IDS via ownerOf (Aerodrome NPM)
 # =========================================================
 def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
-    """
-    For every active position with a token_id, call Aerodrome NPM.ownerOf(tokenId).
-    Preserves minter from previous runs (never overwritten).
-    Updates current_owner on every run.
-    """
     active_token_ids = set()
     for row in positions.values():
         if row["liquidity_raw"] > 0 and row.get("token_id") is not None:
@@ -609,6 +623,9 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
     current_tick = pool_info["current_tick"]
     sqrt_price_x96 = pool_info["sqrt_price_x96"]
 
+    # Current price in USD per LMTS (same as Uniswap indexer)
+    current_price_usd_per_lmts = Decimal(1) / pool_info["price_token1_per_token0"]
+
     positions_rows = []
     owner_aggr = defaultdict(lambda: {
         "label": "external",
@@ -638,7 +655,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         if liq <= 0:
             continue
 
-        pool_owner = row["owner"].lower()  # = Aerodrome NPM for most positions
+        pool_owner = row["owner"].lower()
         tl = int(row["tick_lower"])
         tu = int(row["tick_upper"])
         in_range = tl <= current_tick < tu
@@ -660,6 +677,9 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
 
         label = OUR_WALLETS.get(real_owner, "external")
         otype = "ours" if real_owner in OUR_WALLETS else "external"
+
+        # Price range in USD per LMTS (same logic as Uniswap indexer)
+        price_lower, price_upper = position_price_range_usdc_per_lmts(tl, tu, dec0, dec1)
 
         cur0_dec, cur1_dec = current_amounts_from_liquidity(liq, tl, tu, sqrt_price_x96)
         cur0 = human(cur0_dec, dec0)
@@ -687,6 +707,8 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
             "tick_lower": tl,
             "tick_upper": tu,
             "width_ticks": tu - tl,
+            "price_lower_usd_per_lmts": fmt(price_lower, 6),   # added
+            "price_upper_usd_per_lmts": fmt(price_upper, 6),   # added
             "liquidity": liq,
             "in_range": in_range,
             f"cur_{sym0}": fmt(cur0),
@@ -714,6 +736,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         if token_id is not None:
             ag["token_ids"].append(str(token_id))
 
+        # Buckets stay in ticks (Aerodrome-native)
         b_start = tick_to_bucket_floor(tl, BUCKET_SIZE)
         b_end = tick_to_bucket_floor(tu - 1, BUCKET_SIZE)
         b = b_start
@@ -780,6 +803,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         {"metric": "tick_spacing", "value": pool_info["tick_spacing"]},
         {"metric": "current_tick", "value": current_tick},
         {"metric": f"price_{sym1}_per_{sym0}", "value": fmt(pool_info["price_token1_per_token0"], 8)},
+        {"metric": "price_usd_per_lmts", "value": fmt(current_price_usd_per_lmts, 8)},  # added
         {"metric": "pool_liquidity_raw", "value": pool_info["pool_liquidity_raw"]},
         {"metric": "open_positions", "value": open_pos},
         {"metric": "in_range_positions", "value": in_range_pos},
@@ -858,13 +882,15 @@ def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
     overwrite("aero_buckets", bucket_rows)
     overwrite("aero_summary", summary_rows)
 
+    # --- append to snapshots history ---
     try:
         ws_snap = get_or_create("aero_snapshots")
         existing = ws_snap.get_all_values()
 
         snap_headers = [
             "timestamp_utc", "last_block",
-            "current_tick", "open_positions", "in_range_positions",
+            "price_usd_per_lmts", "current_tick",   # added price_usd_per_lmts
+            "open_positions", "in_range_positions",
             "our_positions", "our_liquidity",
             "our_cur_usdc", "our_cur_lmts",
             "ext_liquidity", "ext_cur_usdc", "ext_cur_lmts",
@@ -887,6 +913,7 @@ def export_to_sheets(pos_rows: list, bucket_rows: list, summary_rows: list):
         snap_row = [
             now_utc,
             sm.get("last_scanned_block", ""),
+            sm.get("price_usd_per_lmts", ""),       # added
             sm.get("current_tick", ""),
             sm.get("open_positions", ""),
             sm.get("in_range_positions", ""),
@@ -930,6 +957,7 @@ def main():
     print(f"Fee:           {pool_info['fee']}  tick_spacing: {pool_info['tick_spacing']}")
     print(f"Current tick:  {pool_info['current_tick']}")
     print(f"Price {pool_info['sym1']}/{pool_info['sym0']}: {fmt(pool_info['price_token1_per_token0'], 8)}")
+    print(f"Price USD/LMTS: {fmt(Decimal(1) / pool_info['price_token1_per_token0'], 8)}")
     print(f"Pool liq raw:  {pool_info['pool_liquidity_raw']:,}")
     print(f"Latest block:  {latest}  safe: {end_block}")
     last = sync.get("last_scanned_block")
