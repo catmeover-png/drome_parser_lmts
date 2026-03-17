@@ -41,6 +41,7 @@ NPM = Web3.to_checksum_address("0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1")
 OUR_WALLETS = {
     "0x5f0aea872b7d6dbcc181338f80048b130e443e3b": "our_pool_wallet",
     "0x44a3f0354f4c10eb9cd93e522b5e3210d126f054": "team_mm2",
+    "0x8EBE6ad4F5Bd2F471E0eB828c5918996Dd2CD756": "buyb_cnbase",
 }
 
 # Google Sheets — separate spreadsheet from Uniswap indexer
