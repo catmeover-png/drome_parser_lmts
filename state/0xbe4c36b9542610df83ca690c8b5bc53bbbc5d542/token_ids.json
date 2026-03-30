@@ -10,13 +10,5 @@
   "3400595": {
     "current_owner": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b",
     "minter": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b"
-  },
-  "3581424": {
-    "current_owner": "0x5b7b715fa5a15f6fec5f332aa19fcf413fb845c9",
-    "minter": "0x5b7b715fa5a15f6fec5f332aa19fcf413fb845c9"
-  },
-  "3582152": {
-    "current_owner": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2",
-    "minter": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2"
   }
 }
