@@ -6,15 +6,16 @@ Aerodrome LP Indexer (Base)
 - First run: full backfill from FROM_BLOCK
 - Subsequent runs: only new blocks since last sync
 - State persisted in state/<pool>/sync.json + events.ndjson
-- PRIMARY KEY for positions: token_id (from IncreaseLiquidity / DecreaseLiquidity on NPM)
-- Burn events matched to token_id via DecreaseLiquidity on NPM (same tx)
-- Current owner resolved via Aerodrome NPM.ownerOf(tokenId) at end of run
+- TokenId tracked via Aerodrome Slipstream NPM IncreaseLiquidity events
+- Current owner resolved via Aerodrome NPM.ownerOf(tokenId) eth_call at end of run
+- Minter tracked in state/<pool>/token_ids.json (preserved across runs)
 - Exports CSV files into out/<pool>/
 - Google Sheets export: aero_positions, aero_buckets, aero_summary, aero_snapshots
+- Price buckets are in USD per 1 LMTS (same as Uniswap indexer)
 
 NOTE: Aerodrome Slipstream uses its own Position Manager (NOT Uniswap NPM).
       Aerodrome NPM on Base: 0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F
-      Pool Mint/Burn event owner = Aerodrome NPM address (not the real wallet).
+      Pool Mint event owner = Aerodrome NPM address (not the real wallet).
       Real wallet = ownerOf(tokenId) on the Aerodrome NPM.
 """
 
@@ -41,6 +42,7 @@ POOL = Web3.to_checksum_address("0xbe4C36B9542610dF83Ca690C8b5BC53BbbC5d542")
 FROM_BLOCK = 43139450
 
 # Aerodrome Slipstream NonfungiblePositionManager on Base
+# (different from Uniswap NPM 0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1)
 NPM = Web3.to_checksum_address("0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F")
 
 OUR_WALLETS = {
@@ -49,6 +51,7 @@ OUR_WALLETS = {
     "0x8ebe6ad4f5bd2f471e0eb828c5918996dd2cd756": "buyb_cnbase",
 }
 
+# Google Sheets — separate spreadsheet from Uniswap indexer
 SPREADSHEET_ID = os.environ.get("AERO_SPREADSHEET_ID", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")
 
@@ -66,6 +69,7 @@ RETRY_SLEEP = 2.0
 TIMEOUT = 30
 CONFIRMATIONS_BUFFER = 5
 
+# price bucket step in USD per 1 LMTS — same as Uniswap indexer
 PRICE_BUCKET_SIZE = Decimal("0.01")
 
 EXPECTED_TOKEN0 = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".lower()  # USDC
@@ -121,9 +125,8 @@ npm_c = w3.eth.contract(address=NPM, abi=NPM_ABI)
 MINT_TOPIC = "0x" + w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
 BURN_TOPIC = "0x" + w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
 
-# Both IncreaseLiquidity and DecreaseLiquidity on NPM — give us token_id per tx
+# Aerodrome Slipstream NPM IncreaseLiquidity — same signature as Uniswap, different contract
 INCREASE_LIQUIDITY_TOPIC = "0x" + w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
-DECREASE_LIQUIDITY_TOPIC = "0x" + w3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
 
 # =========================================================
 # MATH
@@ -292,6 +295,10 @@ def decode_burn_data(data) -> tuple:
     return int(liquidity), int(amount0), int(amount1)
 
 
+def position_key(owner: str, tick_lower: int, tick_upper: int) -> str:
+    return f"{owner.lower()}|{tick_lower}|{tick_upper}"
+
+
 # =========================================================
 # STATE
 # =========================================================
@@ -345,21 +352,6 @@ def append_events(events: list):
 
 
 # =========================================================
-# HELPERS
-# =========================================================
-def _nearest_token_id(candidates: list, ref_log_index: int):
-    """
-    Given a list of {token_id, log_index} dicts from NPM events in the same tx,
-    return the token_id whose log_index is closest to ref_log_index.
-    Returns None if candidates is empty or None.
-    """
-    if not candidates:
-        return None
-    best = min(candidates, key=lambda c: abs(c["log_index"] - ref_log_index))
-    return best["token_id"]
-
-
-# =========================================================
 # COLLECT NEW EVENTS (incremental)
 # =========================================================
 def collect_events(sync: dict, end_block: int) -> dict:
@@ -385,22 +377,12 @@ def collect_events(sync: dict, end_block: int) -> dict:
         mint_logs = get_logs_safe(chunk_start, chunk_end, MINT_TOPIC)
         burn_logs = get_logs_safe(chunk_start, chunk_end, BURN_TOPIC)
 
-        # Pull both IncreaseLiquidity and DecreaseLiquidity from NPM
-        # Both have same data layout: (tokenId indexed, liquidity, amount0, amount1)
         npm_il_logs = get_logs_safe(chunk_start, chunk_end, INCREASE_LIQUIDITY_TOPIC, str(NPM))
-        npm_dl_logs = get_logs_safe(chunk_start, chunk_end, DECREASE_LIQUIDITY_TOPIC, str(NPM))
-
-        # Build tx_hash -> list of {token_id, log_index} for both IL and DL events.
-        # A single tx can contain multiple positions (e.g. batch router), so we store
-        # all candidates and later pick the one with the nearest logIndex to the pool event.
-        npm_token_ids: dict = defaultdict(list)
-        for lg in npm_il_logs + npm_dl_logs:
+        npm_token_ids: dict = {}
+        for lg in npm_il_logs:
             tx = lg["transactionHash"].hex().lower()
             if len(lg["topics"]) >= 2:
-                npm_token_ids[tx].append({
-                    "token_id": topic_to_uint256(lg["topics"][1]),
-                    "log_index": int(lg["logIndex"]),
-                })
+                npm_token_ids[tx] = topic_to_uint256(lg["topics"][1])
 
         new_events = []
 
@@ -416,7 +398,7 @@ def collect_events(sync: dict, end_block: int) -> dict:
             tl = decode_int24_topic(lg["topics"][2])
             tu = decode_int24_topic(lg["topics"][3])
             _, liq, a0, a1 = decode_mint_data(lg["data"])
-            token_id = _nearest_token_id(npm_token_ids.get(tx), idx)
+            token_id = npm_token_ids.get(tx)
 
             new_events.append({
                 "event_id": eid,
@@ -447,8 +429,6 @@ def collect_events(sync: dict, end_block: int) -> dict:
             tl = decode_int24_topic(lg["topics"][2])
             tu = decode_int24_topic(lg["topics"][3])
             liq, a0, a1 = decode_burn_data(lg["data"])
-            # DecreaseLiquidity gives us token_id for burns too — pick nearest by logIndex
-            token_id = _nearest_token_id(npm_token_ids.get(tx), idx)
 
             new_events.append({
                 "event_id": eid,
@@ -462,7 +442,7 @@ def collect_events(sync: dict, end_block: int) -> dict:
                 "liquidity_delta_raw": -liq,
                 "amount0_raw": a0,
                 "amount1_raw": a1,
-                "token_id": token_id,
+                "token_id": None,
             })
             existing_ids.add(eid)
             total_burn += 1
@@ -491,122 +471,6 @@ def collect_events(sync: dict, end_block: int) -> dict:
 
 
 # =========================================================
-# REBUILD POSITIONS
-# Primary key: token_id (int)
-# Fallback for old events without token_id: owner|tl|tu
-#
-# Two-pass approach:
-#   Pass 1: build tl|tu -> token_id map from mint events that have token_id
-#   Pass 2: assign token_id to burn events that lack it using that map
-# =========================================================
-def rebuild_positions() -> dict:
-    """
-    Returns dict keyed by token_id (str) for positions with known token_id,
-    or by "notid:owner|tl|tu" for legacy events without token_id.
-    """
-    if not os.path.exists(EVENTS_FILE):
-        return {}
-
-    raw_events = []
-    with open(EVENTS_FILE, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            ev = json.loads(line)
-            if ev["event_type"] in ("mint", "burn"):
-                raw_events.append(ev)
-
-    # Sort by block + log_index to process in order
-    raw_events.sort(key=lambda e: (e["block_number"], e["log_index"]))
-
-    # Pass 1: build tx_hash -> [{token_id, log_index}] from mint events that have token_id.
-    # A tx can have multiple positions — store all, pick nearest by logIndex when matching burns.
-    tx_to_npm_events: dict = defaultdict(list)
-    for ev in raw_events:
-        if ev["event_type"] == "mint" and ev.get("token_id") is not None:
-            tx_to_npm_events[ev["tx_hash"]].append({
-                "token_id": ev["token_id"],
-                "log_index": ev["log_index"],
-            })
-
-    # Also build owner|tl|tu -> list of token_ids (for burn fallback)
-    # We pick the most recently seen token_id for a given position key
-    otltu_to_token_id: dict = {}
-    for ev in raw_events:
-        if ev["event_type"] == "mint" and ev.get("token_id") is not None:
-            key = f"{ev['owner']}|{ev['tick_lower']}|{ev['tick_upper']}"
-            otltu_to_token_id[key] = ev["token_id"]
-
-    # Pass 2: accumulate positions keyed by token_id
-    positions: dict = {}
-
-    def get_or_create(pos_key: str, ev: dict, token_id) -> dict:
-        if pos_key not in positions:
-            positions[pos_key] = {
-                "pos_key": pos_key,
-                "token_id": token_id,
-                "owner": ev["owner"],
-                "tick_lower": int(ev["tick_lower"]),
-                "tick_upper": int(ev["tick_upper"]),
-                "liquidity_raw": 0,
-                "minted_amount0_raw": 0,
-                "minted_amount1_raw": 0,
-                "burned_amount0_raw": 0,
-                "burned_amount1_raw": 0,
-                "first_seen_block": ev["block_number"],
-                "last_seen_block": ev["block_number"],
-                "mint_count": 0,
-                "burn_count": 0,
-            }
-        row = positions[pos_key]
-        row["first_seen_block"] = min(row["first_seen_block"], ev["block_number"])
-        row["last_seen_block"] = max(row["last_seen_block"], ev["block_number"])
-        return row
-
-    for ev in raw_events:
-        tl = int(ev["tick_lower"])
-        tu = int(ev["tick_upper"])
-        owner = ev["owner"]
-        ev_token_id = ev.get("token_id")
-
-        # Resolve token_id: prefer event's own, then nearest npm event in same tx, then owner|tl|tu map
-        if ev_token_id is None and ev["event_type"] == "burn":
-            ev_token_id = _nearest_token_id(tx_to_npm_events.get(ev["tx_hash"]), ev["log_index"])
-        if ev_token_id is None:
-            otltu_key = f"{owner}|{tl}|{tu}"
-            ev_token_id = otltu_to_token_id.get(otltu_key)
-
-        if ev_token_id is not None:
-            pos_key = f"tid:{ev_token_id}"
-        else:
-            # Genuine fallback — position without any token_id tracking
-            pos_key = f"notid:{owner}|{tl}|{tu}"
-
-        row = get_or_create(pos_key, ev, ev_token_id)
-
-        liq_delta = int(ev["liquidity_delta_raw"])
-        a0 = int(ev["amount0_raw"])
-        a1 = int(ev["amount1_raw"])
-        row["liquidity_raw"] += liq_delta
-
-        if ev["event_type"] == "mint":
-            row["minted_amount0_raw"] += a0
-            row["minted_amount1_raw"] += a1
-            row["mint_count"] += 1
-            # Update owner|tl|tu map as we go (latest mint wins)
-            otltu_key = f"{owner}|{tl}|{tu}"
-            if ev_token_id is not None:
-                otltu_to_token_id[otltu_key] = ev_token_id
-        else:
-            row["burned_amount0_raw"] += a0
-            row["burned_amount1_raw"] += a1
-            row["burn_count"] += 1
-
-    return positions
-
-
-# =========================================================
 # RESOLVE TOKEN IDS via ownerOf (Aerodrome NPM)
 # =========================================================
 def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
@@ -624,7 +488,7 @@ def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
     for token_id in sorted(active_token_ids):
         key = str(token_id)
         if key not in token_ids_state:
-            token_ids_state[key] = {"first_seen_owner": None, "current_owner": None}
+            token_ids_state[key] = {"minter": None, "current_owner": None}
 
         try:
             owner = npm_c.functions.ownerOf(token_id).call().lower()
@@ -632,13 +496,76 @@ def resolve_token_ids(positions: dict, token_ids_state: dict) -> dict:
             owner = None
             print(f"  [warn] ownerOf({token_id}) failed ({e}) — position may be closed")
 
-        if token_ids_state[key]["first_seen_owner"] is None and owner is not None:
-            token_ids_state[key]["first_seen_owner"] = owner
+        if token_ids_state[key]["minter"] is None and owner is not None:
+            token_ids_state[key]["minter"] = owner
 
         token_ids_state[key]["current_owner"] = owner
         time.sleep(0.05)
 
     return token_ids_state
+
+
+# =========================================================
+# REBUILD POSITIONS
+# =========================================================
+def rebuild_positions() -> dict:
+    positions = {}
+    if not os.path.exists(EVENTS_FILE):
+        return positions
+
+    with open(EVENTS_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            ev = json.loads(line)
+            if ev["event_type"] not in ("mint", "burn"):
+                continue
+
+            owner = ev["owner"]
+            tl = int(ev["tick_lower"])
+            tu = int(ev["tick_upper"])
+            key = position_key(owner, tl, tu)
+
+            if key not in positions:
+                positions[key] = {
+                    "owner": owner,
+                    "tick_lower": tl,
+                    "tick_upper": tu,
+                    "liquidity_raw": 0,
+                    "minted_amount0_raw": 0,
+                    "minted_amount1_raw": 0,
+                    "burned_amount0_raw": 0,
+                    "burned_amount1_raw": 0,
+                    "first_seen_block": ev["block_number"],
+                    "last_seen_block": ev["block_number"],
+                    "mint_count": 0,
+                    "burn_count": 0,
+                    "token_id": None,
+                }
+
+            row = positions[key]
+            row["first_seen_block"] = min(row["first_seen_block"], ev["block_number"])
+            row["last_seen_block"] = max(row["last_seen_block"], ev["block_number"])
+
+            if ev.get("token_id") is not None:
+                row["token_id"] = ev["token_id"]
+
+            liq_delta = int(ev["liquidity_delta_raw"])
+            a0 = int(ev["amount0_raw"])
+            a1 = int(ev["amount1_raw"])
+            row["liquidity_raw"] += liq_delta
+
+            if ev["event_type"] == "mint":
+                row["minted_amount0_raw"] += a0
+                row["minted_amount1_raw"] += a1
+                row["mint_count"] += 1
+            else:
+                row["burned_amount0_raw"] += a0
+                row["burned_amount1_raw"] += a1
+                row["burn_count"] += 1
+
+    return positions
 
 
 # =========================================================
@@ -689,8 +616,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
     current_tick = pool_info["current_tick"]
     sqrt_price_x96 = pool_info["sqrt_price_x96"]
 
-    p = pool_info["price_token1_per_token0"]
-    current_price_usd_per_lmts = Decimal(0) if p == 0 else Decimal(1) / p
+    current_price_usd_per_lmts = Decimal(1) / pool_info["price_token1_per_token0"]
 
     positions_rows = []
     owner_aggr = defaultdict(lambda: {
@@ -704,6 +630,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         "token_ids": [],
     })
 
+    # bucket_map keyed by str(price_floor) — same as Uniswap indexer
     bucket_map = defaultdict(lambda: {
         "liq": 0, "our_liq": 0, "ext_liq": 0,
         "pos": 0, "our_pos": 0, "ext_pos": 0,
@@ -722,21 +649,25 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         if liq <= 0:
             continue
 
+        pool_owner = row["owner"].lower()
         tl = int(row["tick_lower"])
         tu = int(row["tick_upper"])
         in_range = tl <= current_tick < tu
         token_id = row.get("token_id")
 
-        first_seen_owner = ""
+        minter = ""
         current_owner = ""
+        real_owner = pool_owner
 
-        # Resolve real owner from token_ids_state
         if token_id is not None:
             nft = token_ids_state.get(str(token_id), {})
-            first_seen_owner = nft.get("first_seen_owner") or ""
+            minter = nft.get("minter") or ""
             current_owner = nft.get("current_owner") or ""
+            if current_owner:
+                real_owner = current_owner
+            elif minter:
+                real_owner = minter
 
-        real_owner = current_owner or first_seen_owner or row["owner"]
         label = OUR_WALLETS.get(real_owner, "external")
         otype = "ours" if real_owner in OUR_WALLETS else "external"
 
@@ -760,12 +691,11 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
 
         positions_rows.append({
             "token_id": token_id if token_id is not None else "",
-            "first_seen_owner": first_seen_owner,
+            "minter": minter,
             "current_owner": current_owner,
-            "real_owner": real_owner,
             "label": label,
             "type": otype,
-            "pool_owner": row["owner"],
+            "pool_owner": pool_owner,
             "tick_lower": tl,
             "tick_upper": tu,
             "width_ticks": tu - tl,
@@ -798,6 +728,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         if token_id is not None:
             ag["token_ids"].append(str(token_id))
 
+        # Price-based buckets — identical logic to Uniswap indexer
         b_start = price_bucket_floor(price_lower, PRICE_BUCKET_SIZE)
         b_end = price_bucket_floor(price_upper, PRICE_BUCKET_SIZE)
         b = b_start
@@ -831,6 +762,7 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         })
     top_lp_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"]))
 
+    # bucket_rows — identical structure to Uniswap indexer
     bucket_rows = []
     for bk_str in sorted(bucket_map.keys(), key=lambda x: Decimal(x)):
         bm = bucket_map[bk_str]
@@ -1019,9 +951,7 @@ def main():
     print(f"Fee:           {pool_info['fee']}  tick_spacing: {pool_info['tick_spacing']}")
     print(f"Current tick:  {pool_info['current_tick']}")
     print(f"Price {pool_info['sym1']}/{pool_info['sym0']}: {fmt(pool_info['price_token1_per_token0'], 8)}")
-    p = pool_info["price_token1_per_token0"]
-    price_usd_str = fmt(Decimal(1) / p, 8) if p != 0 else "0"
-    print(f"Price USD/LMTS: {price_usd_str}")
+    print(f"Price USD/LMTS: {fmt(Decimal(1) / pool_info['price_token1_per_token0'], 8)}")
     print(f"Pool liq raw:  {pool_info['pool_liquidity_raw']:,}")
     print(f"Latest block:  {latest}  safe: {end_block}")
     last = sync.get("last_scanned_block")
@@ -1046,11 +976,8 @@ def main():
     print("=" * 60)
     positions = rebuild_positions()
     active = sum(1 for r in positions.values() if r["liquidity_raw"] > 0)
-    no_token_id = sum(1 for r in positions.values() if r["liquidity_raw"] > 0 and r.get("token_id") is None)
     print(f"  total position keys: {len(positions):,}")
     print(f"  active (liq > 0):    {active:,}")
-    if no_token_id:
-        print(f"  [warn] active positions without token_id: {no_token_id}")
 
     print()
     print("=" * 60)
