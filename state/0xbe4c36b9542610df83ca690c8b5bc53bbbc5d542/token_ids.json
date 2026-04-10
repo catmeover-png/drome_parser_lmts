@@ -11,11 +11,15 @@
     "current_owner": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b",
     "minter": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b"
   },
-  "4260583": {
-    "current_owner": "0xe7fef63fa6e92be10a3bbaaa33087d759beb8c5c",
-    "minter": "0xe7fef63fa6e92be10a3bbaaa33087d759beb8c5c"
+  "4271990": {
+    "current_owner": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b",
+    "minter": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b"
   },
-  "4266785": {
+  "4279557": {
+    "current_owner": "0x6c423bd244987d88c705b91a214bec4721b683cb",
+    "minter": "0x6c423bd244987d88c705b91a214bec4721b683cb"
+  },
+  "4283891": {
     "current_owner": "0x92d894bbca62148841ffff0457918929d2bcd13d",
     "minter": "0x92d894bbca62148841ffff0457918929d2bcd13d"
   }
