@@ -11,15 +11,11 @@
     "current_owner": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b",
     "minter": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b"
   },
-  "4371780": {
-    "current_owner": null,
-    "minter": null
-  },
   "4373516": {
     "current_owner": "0x92d894bbca62148841ffff0457918929d2bcd13d",
     "minter": "0x92d894bbca62148841ffff0457918929d2bcd13d"
   },
-  "4374583": {
+  "4377633": {
     "current_owner": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b",
     "minter": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b"
   }
