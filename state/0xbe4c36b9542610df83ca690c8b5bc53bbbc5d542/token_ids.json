@@ -11,15 +11,19 @@
     "current_owner": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b",
     "minter": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b"
   },
-  "4401948": {
-    "current_owner": null,
-    "minter": null
-  },
   "4409318": {
     "current_owner": "0x92d894bbca62148841ffff0457918929d2bcd13d",
     "minter": "0x92d894bbca62148841ffff0457918929d2bcd13d"
   },
-  "4410781": {
+  "4413777": {
+    "current_owner": "0x6c423bd244987d88c705b91a214bec4721b683cb",
+    "minter": "0x6c423bd244987d88c705b91a214bec4721b683cb"
+  },
+  "4413882": {
+    "current_owner": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b",
+    "minter": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b"
+  },
+  "4415100": {
     "current_owner": null,
     "minter": null
   }
