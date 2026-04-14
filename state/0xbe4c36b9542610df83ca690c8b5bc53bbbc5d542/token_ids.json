@@ -14,17 +14,5 @@
   "4606127": {
     "current_owner": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b",
     "minter": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b"
-  },
-  "4610416": {
-    "current_owner": null,
-    "minter": null
-  },
-  "4610943": {
-    "current_owner": null,
-    "minter": null
-  },
-  "4613020": {
-    "current_owner": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2",
-    "minter": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2"
   }
 }
