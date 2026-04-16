@@ -12,15 +12,15 @@
     "minter": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b"
   },
   "4669816": {
-    "current_owner": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b",
-    "minter": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b"
-  },
-  "4671629": {
     "current_owner": null,
     "minter": null
   },
-  "4671933": {
+  "4672014": {
     "current_owner": "0xe7fef63fa6e92be10a3bbaaa33087d759beb8c5c",
     "minter": "0xe7fef63fa6e92be10a3bbaaa33087d759beb8c5c"
+  },
+  "4672028": {
+    "current_owner": null,
+    "minter": null
   }
 }
