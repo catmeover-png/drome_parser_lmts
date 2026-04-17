@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 * * * *"
+
 permissions:
   contents: write
 
@@ -14,23 +15,13 @@ concurrency:
 jobs:
   run-indexer:
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      - name: Restore state cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/sync.json
-            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/events.ndjson
-            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/token_ids.json
-          key: aero-indexer-state-${{ github.ref_name }}
-          restore-keys: aero-indexer-state-
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -69,6 +60,7 @@ jobs:
 
           git add \
             state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/sync.json \
+            state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/events.ndjson \
             state/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/token_ids.json \
             "out/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/open_positions.csv" \
             "out/0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542/top_lp.csv" \
