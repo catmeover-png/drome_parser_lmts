@@ -18,5 +18,17 @@
   "4679952": {
     "current_owner": null,
     "minter": null
+  },
+  "4680592": {
+    "current_owner": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b",
+    "minter": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b"
+  },
+  "4680756": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "4680776": {
+    "current_owner": "0xf3dad9e8872eb25d8c4d0e8b88d8208dc1cf13e5",
+    "minter": "0xf3dad9e8872eb25d8c4d0e8b88d8208dc1cf13e5"
   }
 }
