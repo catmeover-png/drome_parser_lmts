@@ -184,7 +184,7 @@
     "minter": "0x92d894bbca62148841ffff0457918929d2bcd13d"
   },
   "4698911": {
-    "current_owner": "0xe7fef63fa6e92be10a3bbaaa33087d759beb8c5c",
+    "current_owner": null,
     "minter": "0xe7fef63fa6e92be10a3bbaaa33087d759beb8c5c"
   },
   "4700009": {
@@ -198,5 +198,9 @@
   "4701202": {
     "current_owner": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b",
     "minter": "0x9c175d3bb22b4a2fe0308c52b3a44f26a2704f4b"
+  },
+  "4702386": {
+    "current_owner": "0x621e4e87677978ddae0cebdfdc5fcf43334693f0",
+    "minter": "0x621e4e87677978ddae0cebdfdc5fcf43334693f0"
   }
 }
