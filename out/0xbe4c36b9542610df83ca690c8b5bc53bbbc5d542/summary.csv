@@ -3,7 +3,7 @@ pool,0xbe4C36B9542610dF83Ca690C8b5BC53BbbC5d542
 npm,0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F
 chain_id,8453
 from_block,43139450
-last_scanned_block,44965871
+last_scanned_block,44967555
 token0_usdc,0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
 token1_lmts,0x9EadbE35F3Ee3bF3e28180070C429298a1b02F93
 dec0,6
@@ -11,8 +11,8 @@ dec1,18
 fee,500
 tick_spacing,10
 current_tick,300453
-price_lmts_per_usdc,11.16566086
-price_usd_per_lmts,0.08956031
+price_lmts_per_usdc,11.16513119
+price_usd_per_lmts,0.08956455
 pool_liquidity_raw,1789367223328739876
 open_positions,6
 in_range_positions,3
@@ -20,7 +20,7 @@ unique_real_owners,4
 our_positions,4
 our_liquidity,3146694440669167520
 ext_liquidity,121857152228919469
-our_cur_usdc,70994.784854
-our_cur_lmts,3257792.325690
-ext_cur_usdc,265.558993
-ext_cur_lmts,75.084707
+our_cur_usdc,71006.622702
+our_cur_lmts,3257660.151434
+ext_cur_usdc,266.423087
+ext_cur_lmts,65.436756
