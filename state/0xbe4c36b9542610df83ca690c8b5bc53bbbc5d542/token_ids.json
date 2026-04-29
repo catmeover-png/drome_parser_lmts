@@ -702,5 +702,13 @@
   "4788049": {
     "current_owner": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2",
     "minter": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2"
+  },
+  "4788213": {
+    "current_owner": "0xf3dad9e8872eb25d8c4d0e8b88d8208dc1cf13e5",
+    "minter": "0xf3dad9e8872eb25d8c4d0e8b88d8208dc1cf13e5"
+  },
+  "4788218": {
+    "current_owner": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2",
+    "minter": "0xf1a0b11fcf3580a9c80cb56aef95fceb949c60a2"
   }
 }
