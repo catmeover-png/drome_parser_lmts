@@ -47,6 +47,7 @@ jobs:
         run: python src/aerodrome_indexer.py
 
       - name: Upload CSV artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aerodrome-lp-exports-${{ github.run_number }}
@@ -54,6 +55,7 @@ jobs:
           retention-days: 30
 
       - name: Commit state and exports
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
