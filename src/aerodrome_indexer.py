@@ -409,13 +409,12 @@ def collect_events(sync: dict, end_block: int) -> dict:
 
         mint_logs = get_logs_safe(chunk_start, chunk_end, MINT_TOPIC)
         burn_logs = get_logs_safe(chunk_start, chunk_end, BURN_TOPIC)
-
         npm_il_logs = get_logs_safe(chunk_start, chunk_end, INCREASE_LIQUIDITY_TOPIC, str(NPM))
 
         print(
             f"  [debug] chunk {i}/{total_chunks}: "
             f"mint_logs={len(mint_logs)} burn_logs={len(burn_logs)} npm_il_logs={len(npm_il_logs)}",
-            flush=True
+            flush=True,
         )
 
         npm_token_ids: dict = {}
@@ -427,7 +426,7 @@ def collect_events(sync: dict, end_block: int) -> dict:
         print(
             f"  [debug] chunk {i}/{total_chunks}: "
             f"npm_token_ids mapped={len(npm_token_ids)}",
-            flush=True
+            flush=True,
         )
 
         new_events = []
@@ -436,10 +435,12 @@ def collect_events(sync: dict, end_block: int) -> dict:
             tx = lg["transactionHash"].hex().lower()
             idx = int(lg["logIndex"])
             eid = f"mint:{tx}:{idx}"
+
             if eid in existing_ids:
                 continue
             if len(lg["topics"]) < 4:
                 continue
+
             owner = topic_to_address(lg["topics"][1])
             tl = decode_int24_topic(lg["topics"][2])
             tu = decode_int24_topic(lg["topics"][3])
@@ -460,6 +461,7 @@ def collect_events(sync: dict, end_block: int) -> dict:
                 "amount1_raw": a1,
                 "token_id": token_id,
             })
+
             existing_ids.add(eid)
             total_mint += 1
 
@@ -467,10 +469,12 @@ def collect_events(sync: dict, end_block: int) -> dict:
             tx = lg["transactionHash"].hex().lower()
             idx = int(lg["logIndex"])
             eid = f"burn:{tx}:{idx}"
+
             if eid in existing_ids:
                 continue
             if len(lg["topics"]) < 4:
                 continue
+
             owner = topic_to_address(lg["topics"][1])
             tl = decode_int24_topic(lg["topics"][2])
             tu = decode_int24_topic(lg["topics"][3])
@@ -490,23 +494,24 @@ def collect_events(sync: dict, end_block: int) -> dict:
                 "amount1_raw": a1,
                 "token_id": None,
             })
+
             existing_ids.add(eid)
             total_burn += 1
 
         print(
             f"  [debug] chunk {i}/{total_chunks}: "
             f"new_events ready={len(new_events)}",
-            flush=True
-         )
+            flush=True,
+        )
 
-         append_events(new_events)
+        append_events(new_events)
 
-         print(
-             f"  [debug] chunk {i}/{total_chunks}: append_events done",
-             flush=True
-         )
+        print(
+            f"  [debug] chunk {i}/{total_chunks}: append_events done",
+            flush=True,
+        )
 
-         total_written += len(new_events)
+        total_written += len(new_events)
 
         sync["last_scanned_block"] = chunk_end
         save_sync(sync)
@@ -526,7 +531,6 @@ def collect_events(sync: dict, end_block: int) -> dict:
         "burn": total_burn,
         "written": total_written,
     }
-
 
 # =========================================================
 # RESOLVE TOKEN IDS via ownerOf (Aerodrome NPM)
@@ -1056,7 +1060,10 @@ def main():
     print("=" * 60)
     print("  [debug] build_exports start", flush=True)
     pos_rows, lp_rows, bucket_rows, summary_rows = build_exports(
-    positions, token_ids_state, pool_info, sync
+        positions, 
+        token_ids_state, 
+        pool_info, 
+        sync
     )
     print("  [debug] build_exports done", flush=True)
     write_csv(os.path.join(OUT_DIR, "open_positions.csv"), pos_rows)
