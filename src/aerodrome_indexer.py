@@ -411,11 +411,24 @@ def collect_events(sync: dict, end_block: int) -> dict:
         burn_logs = get_logs_safe(chunk_start, chunk_end, BURN_TOPIC)
 
         npm_il_logs = get_logs_safe(chunk_start, chunk_end, INCREASE_LIQUIDITY_TOPIC, str(NPM))
+
+        print(
+            f"  [debug] chunk {i}/{total_chunks}: "
+            f"mint_logs={len(mint_logs)} burn_logs={len(burn_logs)} npm_il_logs={len(npm_il_logs)}",
+            flush=True
+        )
+
         npm_token_ids: dict = {}
         for lg in npm_il_logs:
             tx = lg["transactionHash"].hex().lower()
             if len(lg["topics"]) >= 2:
                 npm_token_ids[tx] = topic_to_uint256(lg["topics"][1])
+
+        print(
+            f"  [debug] chunk {i}/{total_chunks}: "
+            f"npm_token_ids mapped={len(npm_token_ids)}",
+            flush=True
+        )
 
         new_events = []
 
@@ -480,8 +493,20 @@ def collect_events(sync: dict, end_block: int) -> dict:
             existing_ids.add(eid)
             total_burn += 1
 
-        append_events(new_events)
-        total_written += len(new_events)
+        print(
+            f"  [debug] chunk {i}/{total_chunks}: "
+            f"new_events ready={len(new_events)}",
+            flush=True
+         )
+
+         append_events(new_events)
+
+         print(
+             f"  [debug] chunk {i}/{total_chunks}: append_events done",
+             flush=True
+         )
+
+         total_written += len(new_events)
 
         sync["last_scanned_block"] = chunk_end
         save_sync(sync)
@@ -1007,7 +1032,9 @@ def main():
     print("=" * 60)
     print("REBUILDING SNAPSHOT")
     print("=" * 60)
+    print("  [debug] rebuild_positions start", flush=True)
     positions = rebuild_positions()
+    print("  [debug] rebuild_positions done", flush=True)
     active = sum(1 for r in positions.values() if r["liquidity_raw"] > 0)
     print(f"  total position keys: {len(positions):,}")
     print(f"  active (liq > 0):    {active:,}")
@@ -1017,7 +1044,9 @@ def main():
     print("RESOLVING TOKEN OWNERS")
     print("=" * 60)
     token_ids_state = load_token_ids()
+    print("  [debug] resolve_token_ids start", flush=True)
     token_ids_state = resolve_token_ids(positions, token_ids_state)
+    print("  [debug] resolve_token_ids done", flush=True)
     save_token_ids(token_ids_state)
     print(f"  total tokenIds tracked: {len(token_ids_state)}")
 
@@ -1025,10 +1054,11 @@ def main():
     print("=" * 60)
     print("WRITING EXPORTS")
     print("=" * 60)
+    print("  [debug] build_exports start", flush=True)
     pos_rows, lp_rows, bucket_rows, summary_rows = build_exports(
-        positions, token_ids_state, pool_info, sync
+    positions, token_ids_state, pool_info, sync
     )
-
+    print("  [debug] build_exports done", flush=True)
     write_csv(os.path.join(OUT_DIR, "open_positions.csv"), pos_rows)
     write_csv(os.path.join(OUT_DIR, "top_lp.csv"), lp_rows)
     write_csv(os.path.join(OUT_DIR, "buckets.csv"), bucket_rows)
@@ -1038,7 +1068,9 @@ def main():
     print("=" * 60)
     print("GOOGLE SHEETS EXPORT")
     print("=" * 60)
+    print("  [debug] export_to_sheets start", flush=True)
     export_to_sheets(pos_rows, bucket_rows, summary_rows)
+    print("  [debug] export_to_sheets done", flush=True)
 
     print()
     print("=== SUMMARY ===")
