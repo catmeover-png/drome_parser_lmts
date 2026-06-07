@@ -209,23 +209,14 @@ def safe_call(fn):
     raise last
 
 
- RPC HELPERS
-# =========================================================
-def safe_call(fn):
-    last = None
-    for attempt in range(RETRIES):
-        try:
-            return fn.call()
-        except Exception as e:
-            last = e
-            wait = RETRY_SLEEP * (attempt + 1)
-            print(f"  [warn] call failed ({e}), retry in {wait:.1f}s")
-            time.sleep(wait)
-    raise last
-
-
 def get_logs_with_retry(params: dict) -> list:
     fixed = dict(params)
+
+    original_from = fixed.get("fromBlock")
+    original_to = fixed.get("toBlock")
+    address = fixed.get("address")
+    topic = fixed.get("topics", [None])[0]
+
     if "fromBlock" in fixed and isinstance(fixed["fromBlock"], int):
         fixed["fromBlock"] = hex(fixed["fromBlock"])
     if "toBlock" in fixed and isinstance(fixed["toBlock"], int):
@@ -234,51 +225,42 @@ def get_logs_with_retry(params: dict) -> list:
     last = None
     for attempt in range(RETRIES):
         try:
-            return w3.eth.get_logs(fixed)
+            print(
+                f"  [rpc] get_logs request "
+                f"{original_from} -> {original_to} "
+                f"attempt {attempt + 1}/{RETRIES} "
+                f"address={address} topic={topic}",
+                flush=True
+            )
+
+            logs = w3.eth.get_logs(fixed)
+
+            print(
+                f"  [rpc] get_logs ok "
+                f"{original_from} -> {original_to}: {len(logs)} logs",
+                flush=True
+            )
+
+            return logs
+
         except Exception as e:
             last = e
             wait = RETRY_SLEEP * (attempt + 1)
             msg = str(e)
+
             if "query returned more than" in msg or "block range" in msg.lower() or "limit exceeded" in msg.lower():
                 raise
-            print(f"  [warn] get_logs failed ({e}), retry in {wait:.1f}s")
+
+            print(
+                f"  [warn] get_logs failed "
+                f"{original_from} -> {original_to} "
+                f"attempt {attempt + 1}/{RETRIES}: {e}, "
+                f"retry in {wait:.1f}s",
+                flush=True
+            )
+
             time.sleep(wait)
-    raise last
 
-
-def get_logs_safe(from_block: int, to_block: int, topic: str, address: str = None) -> list:
-    if from_block > to_block:
-        return []
-    addr = address or str(POOL)
-    try:
-        return get_logs_with_retry({
-            "fromBlock": from_block,
-            "toBlock": to_block,
-            "address": addr,
-            "topics": [topic],
-        })
-    except Exception as e:
-        if from_block == to_block:
-            print(f"  [error] single block {from_block} failed: {e}")
-            return []
-        mid = (from_block + to_block) // 2
-        left = get_logs_safe(from_block, mid, topic, address)
-        right = get_logs_safe(mid + 1, to_block, topic, address)
-        return left + right
-
-
-    last = None
-    for attempt in range(RETRIES):
-        try:
-            return w3.eth.get_logs(fixed)
-        except Exception as e:
-            last = e
-            wait = RETRY_SLEEP * (attempt + 1)
-            msg = str(e)
-            if "query returned more than" in msg or "block range" in msg.lower() or "limit exceeded" in msg.lower():
-                raise
-            print(f"  [warn] get_logs failed ({e}), retry in {wait:.1f}s")
-            time.sleep(wait)
     raise last
 
 
