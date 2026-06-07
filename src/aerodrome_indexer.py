@@ -680,6 +680,13 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
 
     current_price_usd_per_lmts = Decimal(1) / pool_info["price_token1_per_token0"]
 
+    # окно бакетов: клипуем диапазон, чтобы full-range позиции
+    # не раздували цикл (шаг 0.01) до бесконечности
+    BUCKET_WINDOW_FACTOR = Decimal("20")          # до 20x от текущей цены
+    BUCKET_MIN = Decimal("0")
+    BUCKET_MAX = current_price_usd_per_lmts * BUCKET_WINDOW_FACTOR
+    MAX_BUCKETS_PER_POSITION = 5000               # жёсткий предохранитель
+
     positions_rows = []
     owner_aggr = defaultdict(lambda: {
         "label": "external",
@@ -692,7 +699,6 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         "token_ids": [],
     })
 
-    # bucket_map keyed by str(price_floor) — same as Uniswap indexer
     bucket_map = defaultdict(lambda: {
         "liq": 0, "our_liq": 0, "ext_liq": 0,
         "pos": 0, "our_pos": 0, "ext_pos": 0,
@@ -790,22 +796,26 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         if token_id is not None:
             ag["token_ids"].append(str(token_id))
 
-        # Price-based buckets — identical logic to Uniswap indexer
-        b_start = price_bucket_floor(price_lower, PRICE_BUCKET_SIZE)
-        b_end = price_bucket_floor(price_upper, PRICE_BUCKET_SIZE)
-        b = b_start
-        while b <= b_end:
-            bm = bucket_map[str(b)]
-            bm["liq"] += liq
-            bm["pos"] += 1
-            bm["owners"].add(real_owner)
-            if otype == "ours":
-                bm["our_liq"] += liq
-                bm["our_pos"] += 1
-            else:
-                bm["ext_liq"] += liq
-                bm["ext_pos"] += 1
-            b += PRICE_BUCKET_SIZE
+        # Price-based buckets — ограничено окном [BUCKET_MIN, BUCKET_MAX]
+        lo = max(price_lower, BUCKET_MIN)
+        hi = min(price_upper, BUCKET_MAX)
+        if hi >= lo:
+            b = price_bucket_floor(lo, PRICE_BUCKET_SIZE)
+            b_end = price_bucket_floor(hi, PRICE_BUCKET_SIZE)
+            steps = 0
+            while b <= b_end and steps < MAX_BUCKETS_PER_POSITION:
+                bm = bucket_map[str(b)]
+                bm["liq"] += liq
+                bm["pos"] += 1
+                bm["owners"].add(real_owner)
+                if otype == "ours":
+                    bm["our_liq"] += liq
+                    bm["our_pos"] += 1
+                else:
+                    bm["ext_liq"] += liq
+                    bm["ext_pos"] += 1
+                b += PRICE_BUCKET_SIZE
+                steps += 1
 
     positions_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"], r["current_owner"]))
 
@@ -824,7 +834,6 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
         })
     top_lp_rows.sort(key=lambda r: (r["type"] != "ours", -r["liquidity"]))
 
-    # bucket_rows — identical structure to Uniswap indexer
     bucket_rows = []
     for bk_str in sorted(bucket_map.keys(), key=lambda x: Decimal(x)):
         bm = bucket_map[bk_str]
@@ -875,8 +884,6 @@ def build_exports(positions: dict, token_ids_state: dict, pool_info: dict, sync:
     ]
 
     return positions_rows, top_lp_rows, bucket_rows, summary_rows
-
-
 # =========================================================
 # CSV WRITER
 # =========================================================
