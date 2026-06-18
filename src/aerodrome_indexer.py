@@ -49,6 +49,7 @@ OUR_WALLETS = {
     "0x5f0aea872b7d6dbcc181338f80048b130e443e3b": "our_pool_wallet",
     "0x44a3f0354f4c10eb9cd93e522b5e3210d126f054": "team_mm2",
     "0x8ebe6ad4f5bd2f471e0eb828c5918996dd2cd756": "buyb_cnbase",
+    "0x42f4b7EC748e1c858471FB9FB6e147fE66FDBa5e": "our_new_5e",
 }
 
 # Google Sheets — separate spreadsheet from Uniswap indexer
