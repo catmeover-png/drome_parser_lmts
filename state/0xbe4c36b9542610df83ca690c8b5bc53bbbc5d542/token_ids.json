@@ -926,5 +926,9 @@
   "4987248": {
     "current_owner": "0x6cd6f5f8af443b1b4031a9742cf19f4094a38e07",
     "minter": "0x6cd6f5f8af443b1b4031a9742cf19f4094a38e07"
+  },
+  "5008249": {
+    "current_owner": "0x36e422e2a279470d9fe1a5f3f807d2f3a39a4b90",
+    "minter": "0x36e422e2a279470d9fe1a5f3f807d2f3a39a4b90"
   }
 }
