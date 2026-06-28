@@ -930,5 +930,9 @@
   "5008249": {
     "current_owner": "0x36e422e2a279470d9fe1a5f3f807d2f3a39a4b90",
     "minter": "0x36e422e2a279470d9fe1a5f3f807d2f3a39a4b90"
+  },
+  "5010173": {
+    "current_owner": "0x7d0cd48b7cd16ae64619919fc0e6b8e9de8024b6",
+    "minter": "0x7d0cd48b7cd16ae64619919fc0e6b8e9de8024b6"
   }
 }
