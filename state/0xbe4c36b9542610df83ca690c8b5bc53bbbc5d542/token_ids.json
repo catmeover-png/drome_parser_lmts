@@ -1230,5 +1230,9 @@
   "5101216": {
     "current_owner": "0x7d0cd48b7cd16ae64619919fc0e6b8e9de8024b6",
     "minter": "0x7d0cd48b7cd16ae64619919fc0e6b8e9de8024b6"
+  },
+  "5147503": {
+    "current_owner": "0x0d9b7e55940d23d4128ac82358c3bdacd9688851",
+    "minter": "0x0d9b7e55940d23d4128ac82358c3bdacd9688851"
   }
 }
