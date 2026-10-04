@@ -1546,5 +1546,9 @@
   "5236651": {
     "current_owner": "0x92d894bbca62148841ffff0457918929d2bcd13d",
     "minter": "0x92d894bbca62148841ffff0457918929d2bcd13d"
+  },
+  "5252596": {
+    "current_owner": "0x65a23ee13851e61a6687f12eaf9374a424ad6afd",
+    "minter": "0x65a23ee13851e61a6687f12eaf9374a424ad6afd"
   }
 }
