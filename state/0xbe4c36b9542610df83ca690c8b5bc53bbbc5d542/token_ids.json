@@ -1582,5 +1582,17 @@
   "5253162": {
     "current_owner": "0x65a23ee13851e61a6687f12eaf9374a424ad6afd",
     "minter": "0x65a23ee13851e61a6687f12eaf9374a424ad6afd"
+  },
+  "5253200": {
+    "current_owner": "0xceeff8f62defbaa1b0b7d8fa40c382486caebc55",
+    "minter": "0xceeff8f62defbaa1b0b7d8fa40c382486caebc55"
+  },
+  "5253217": {
+    "current_owner": "0x65a23ee13851e61a6687f12eaf9374a424ad6afd",
+    "minter": "0x65a23ee13851e61a6687f12eaf9374a424ad6afd"
+  },
+  "5253222": {
+    "current_owner": "0xc3719520e9bb3805986970865c6d6b8fce6dbc89",
+    "minter": "0xc3719520e9bb3805986970865c6d6b8fce6dbc89"
   }
 }
