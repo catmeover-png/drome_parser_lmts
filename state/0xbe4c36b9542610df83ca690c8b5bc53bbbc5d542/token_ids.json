@@ -1634,5 +1634,13 @@
   "5254442": {
     "current_owner": "0x92d894bbca62148841ffff0457918929d2bcd13d",
     "minter": "0x92d894bbca62148841ffff0457918929d2bcd13d"
+  },
+  "5254617": {
+    "current_owner": "0xc3719520e9bb3805986970865c6d6b8fce6dbc89",
+    "minter": "0xc3719520e9bb3805986970865c6d6b8fce6dbc89"
+  },
+  "5254624": {
+    "current_owner": "0x92d894bbca62148841ffff0457918929d2bcd13d",
+    "minter": "0x92d894bbca62148841ffff0457918929d2bcd13d"
   }
 }
