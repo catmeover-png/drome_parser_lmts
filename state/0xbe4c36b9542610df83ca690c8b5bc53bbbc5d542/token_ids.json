@@ -1815,6 +1815,10 @@
     "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
     "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
   },
+  "5263036": {
+    "current_owner": "0x61040e143a77f165ba44543af4a079f2c809d14b",
+    "minter": "0x61040e143a77f165ba44543af4a079f2c809d14b"
+  },
   "5263068": {
     "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
     "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
@@ -1836,6 +1840,58 @@
     "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
   },
   "5263651": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5263661": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5264596": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5267928": {
+    "current_owner": "0x61040e143a77f165ba44543af4a079f2c809d14b",
+    "minter": "0x61040e143a77f165ba44543af4a079f2c809d14b"
+  },
+  "5267981": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268143": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268147": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268162": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268164": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268166": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268216": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268218": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268355": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5268429": {
     "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
     "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
   }
