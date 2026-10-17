@@ -1923,6 +1923,10 @@
     "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
     "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
   },
+  "5274061": {
+    "current_owner": "0x5b29c69383f3e4d274511df97486207315eade6d",
+    "minter": "0x5b29c69383f3e4d274511df97486207315eade6d"
+  },
   "5274148": {
     "current_owner": null,
     "minter": null
@@ -2000,6 +2004,14 @@
     "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
   },
   "5286350": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5294309": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5294412": {
     "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
     "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
   }
