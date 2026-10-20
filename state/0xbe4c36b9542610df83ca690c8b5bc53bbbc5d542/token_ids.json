@@ -2454,5 +2454,57 @@
   "5336104": {
     "current_owner": null,
     "minter": null
+  },
+  "5336113": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5336538": {
+    "current_owner": null,
+    "minter": null
+  },
+  "5336561": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5336875": {
+    "current_owner": null,
+    "minter": null
+  },
+  "5337036": {
+    "current_owner": null,
+    "minter": null
+  },
+  "5337170": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5337178": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5337204": {
+    "current_owner": null,
+    "minter": null
+  },
+  "5337217": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5337236": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5337248": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5337249": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
+  },
+  "5337251": {
+    "current_owner": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410",
+    "minter": "0xaf61fd5edb1ef14ab22988818709b3a062bf8410"
   }
 }
