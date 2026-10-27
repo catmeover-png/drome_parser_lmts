@@ -2674,5 +2674,13 @@
   "5349783": {
     "current_owner": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b",
     "minter": "0x5f0aea872b7d6dbcc181338f80048b130e443e3b"
+  },
+  "5349876": {
+    "current_owner": "0xe49121e839d659d8e944f2a63eecc319eb76ea1f",
+    "minter": "0xe49121e839d659d8e944f2a63eecc319eb76ea1f"
+  },
+  "5349879": {
+    "current_owner": "0xe49121e839d659d8e944f2a63eecc319eb76ea1f",
+    "minter": "0xe49121e839d659d8e944f2a63eecc319eb76ea1f"
   }
 }
